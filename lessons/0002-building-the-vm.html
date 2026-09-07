@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Lesson 2: Building the Virtual Machine</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<h1>Building the Virtual Machine</h1>
+<p class="lesson-meta">
+  Lesson 2 &middot; g8 bytecode VM &middot;
+  Prev: <a href="0001-ast-to-stack-bytecode.html">AST to Stack Bytecode</a> &middot;
+  Reference: <a href="../reference/bytecode-instruction-set.html">Instruction Set</a>
+</p>
+
+<p>
+  Bytecode is just bytes in an array. It doesn't do anything until something reads those bytes
+  and acts on them. That something is a <strong>virtual machine</strong> — a loop that fetches
+  an instruction, decodes it, and executes it. Over and over, until the program is done.
+</p>
+
+<h2>The fetch-decode-execute cycle</h2>
+
+<p>
+  Every CPU works this way. Your VM is a software CPU. It has three pieces of state:
+</p>
+
+<table class="ref-table">
+  <thead><tr><th>State</th><th>What it is</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><code>ip</code> (instruction pointer)</td>
+      <td>An index into the <code>Code</code> array. Points at the <em>next</em> byte to read.</td>
+    </tr>
+    <tr>
+      <td><code>stack</code></td>
+      <td>A slice of <code>int</code>. Operands and intermediate results live here.</td>
+    </tr>
+    <tr>
+      <td><code>program</code></td>
+      <td>The <code>Program</code> from the compiler — the <code>Code</code> bytes and <code>Constants</code> pool.</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>
+  The loop does three things on each iteration:
+</p>
+
+<ol>
+  <li><strong>Fetch</strong> — read the byte at <code>Code[ip]</code>, advance <code>ip</code></li>
+  <li><strong>Decode</strong> — interpret that byte as an opcode (a <code>switch</code> statement)</li>
+  <li><strong>Execute</strong> — do what the opcode says (push, pop, compute)</li>
+</ol>
+
+<pre><code>for vm.ip &lt; len(program.Code) {
+    opcode := OpCode(program.Code[vm.ip])
+    vm.ip++
+
+    switch opcode {
+    case OpPush:
+        // fetch the operand (next byte = constant pool index)
+        // push the constant
+    case OpAdd:
+        // pop two, push sum
+    case OpMul:
+        // pop two, push product
+    }
+}
+// result is the single value left on the stack</code></pre>
+
+<div class="callout">
+  <strong>The IP always points ahead.</strong> The moment you read a byte, you advance past it.
+  By the time you're inside a <code>case</code> body, <code>ip</code> already points at the
+  next instruction (or at the operand, for <code>OpPush</code>). This matters when an instruction
+  has operand bytes — you read those by advancing <code>ip</code> again.
+  <br><br>
+  <em>Source:</em> <a href="https://craftinginterpreters.com/a-virtual-machine.html">Crafting Interpreters, Ch. 15</a>
+</div>
+
+<h2>Stack operations</h2>
+
+<p>
+  The stack is just a Go slice. You need two operations:
+</p>
+
+<pre><code>func (vm *VM) push(value int) {
+    vm.stack = append(vm.stack, value)
+}
+
+func (vm *VM) pop() int {
+    n := len(vm.stack) - 1
+    val := vm.stack[n]
+    vm.stack = vm.stack[:n]
+    return val
+}</code></pre>
+
+<p>
+  That's it. In a production VM you'd use a fixed-size array for cache locality and avoid
+  slice header overhead, but a slice is correct and clear for now.
+</p>
+
+<h2>Instruction handlers</h2>
+
+<p>Each opcode has a handler. Yours have three:</p>
+
+<h3>OpPush</h3>
+<p>
+  <code>OpPush</code> has a one-byte operand: the constant pool index. Read it by
+  fetching the next byte and advancing <code>ip</code> again:
+</p>
+<pre><code>case OpPush:
+    idx := program.Code[vm.ip]
+    vm.ip++
+    vm.push(program.Constants[idx])</code></pre>
+
+<p>
+  Two bytes consumed total: the opcode, then the operand. This is a
+  <strong>variable-length instruction</strong> — <code>OpPush</code> is 2 bytes
+  while <code>OpAdd</code> and <code>OpMul</code> are 1 byte each.
+</p>
+
+<h3>OpAdd and OpMul</h3>
+<p>
+  Both work the same way: pop two values, compute, push the result. The only difference
+  is the operation.
+</p>
+<pre><code>case OpAdd:
+    b := vm.pop()  // right operand (pushed second, so popped first)
+    a := vm.pop()  // left operand
+    vm.push(a + b)
+
+case OpMul:
+    b := vm.pop()
+    a := vm.pop()
+    vm.push(a * b)</code></pre>
+
+<div class="callout warn">
+  <strong>Pop order matters.</strong> The right operand was pushed last (it was compiled second),
+  so it's on top of the stack — it gets popped first. For addition and multiplication this doesn't
+  matter (they're commutative), but it will matter the moment you add subtraction or division.
+  Build the habit now.
+</div>
+
+<h2>Watch it run</h2>
+
+<p>
+  The same bytecode from Lesson 1, but now focus on the <code>ip</code> alongside the stack.
+  Notice how <code>ip</code> advances by 2 for <code>OpPush</code> (opcode + operand) and by 1 for operators.
+</p>
+
+<div class="stepper" data-steps='[
+  {"label":"ip=0 → fetch OpPush, ip=1 → fetch idx=0, ip=2 → push constants[0]=30","stack":[30]},
+  {"label":"ip=2 → fetch OpPush, ip=3 → fetch idx=1, ip=4 → push constants[1]=20","stack":[30,20]},
+  {"label":"ip=4 → fetch OpPush, ip=5 → fetch idx=2, ip=6 → push constants[2]=40","stack":[30,20,40]},
+  {"label":"ip=6 → fetch OpMul, ip=7 → pop 40, pop 20, push 800","stack":[30,800]},
+  {"label":"ip=7 → fetch OpAdd, ip=8 → pop 800, pop 30, push 830","stack":[830]}
+]'>
+  <div class="stepper-controls">
+    <button data-prev>&larr; Prev</button>
+    <button data-next>Next &rarr;</button>
+    <span class="stepper-status">ready</span>
+  </div>
+  <div class="stepper-body">
+    <div class="stepper-instructions">
+      <div><code>0:</code> OpPush 0</div>
+      <div><code>2:</code> OpPush 1</div>
+      <div><code>4:</code> OpPush 2</div>
+      <div><code>6:</code> OpMul</div>
+      <div><code>7:</code> OpAdd</div>
+    </div>
+    <div class="stepper-stack">
+      <div class="stepper-stack-label">Stack</div>
+    </div>
+  </div>
+</div>
+
+<h2>Putting it all together</h2>
+
+<p>Here's the complete VM. It's about 40 lines:</p>
+
+<pre><code>type VM struct {
+    ip    int
+    stack []int
+}
+
+func Run(program *Program) int {
+    vm := &amp;VM{}
+
+    for vm.ip &lt; len(program.Code) {
+        op := OpCode(program.Code[vm.ip])
+        vm.ip++
+
+        switch op {
+        case OpPush:
+            idx := program.Code[vm.ip]
+            vm.ip++
+            vm.push(program.Constants[idx])
+
+        case OpAdd:
+            b := vm.pop()
+            a := vm.pop()
+            vm.push(a + b)
+
+        case OpMul:
+            b := vm.pop()
+            a := vm.pop()
+            vm.push(a * b)
+        }
+    }
+
+    return vm.pop()
+}
+
+func (vm *VM) push(v int) {
+    vm.stack = append(vm.stack, v)
+}
+
+func (vm *VM) pop() int {
+    n := len(vm.stack) - 1
+    v := vm.stack[n]
+    vm.stack = vm.stack[:n]
+    return v
+}</code></pre>
+
+<h2>Check your understanding</h2>
+
+<div class="quiz" data-correct="0"
+     data-right="Correct. The Code array is: [OpPush, 0, OpPush, 1, OpPush, 2, OpMul, OpAdd] — that's 8 bytes. The ip walks from 0 to 8."
+     data-wrong="Count the bytes: each OpPush is 2 bytes (opcode + operand), each operator is 1 byte. Three pushes + two operators = ?">
+  <div class="quiz-question">
+    For the program <code>30 + (20 * 40)</code>, what is the final value of <code>ip</code> when the loop exits?
+  </div>
+  <div class="quiz-options">
+    <div class="quiz-option">8</div>
+    <div class="quiz-option">5</div>
+    <div class="quiz-option">7</div>
+    <div class="quiz-option">6</div>
+  </div>
+  <div class="quiz-feedback"></div>
+</div>
+
+<div class="quiz" data-correct="2"
+     data-right="Correct. The compiler emits OpPush 0, OpPush 1, OpMul — constants [7, 3]. The VM pushes 7, pushes 3, pops both, pushes 21."
+     data-wrong="Trace the full pipeline: lex → parse → compile (post-order traversal) → execute. What bytecode does the compiler emit for this AST?">
+  <div class="quiz-question">
+    You feed <code>7 * 3</code> through the full pipeline (lex → parse → compile → run). What does <code>Run()</code> return?
+  </div>
+  <div class="quiz-options">
+    <div class="quiz-option">10</div>
+    <div class="quiz-option">3</div>
+    <div class="quiz-option">21</div>
+    <div class="quiz-option">73</div>
+  </div>
+  <div class="quiz-feedback"></div>
+</div>
+
+<h2>Now implement it</h2>
+
+<p>
+  If you haven't already implemented the <code>Compile</code> function from
+  <a href="0001-ast-to-stack-bytecode.html">Lesson 1</a>, now is the time — you need bytecode to
+  feed the VM.
+</p>
+
+<p>
+  Add the <code>VM</code> and <code>Run</code> to your <code>bytecode.go</code> (or a new <code>vm.go</code>),
+  then write an end-to-end test:
+</p>
+
+<pre><code>func TestEndToEnd(t *testing.T) {
+    input := "30 + (20 * 40)"
+
+    // Lex
+    var l Lexer
+    tokens := l.Lex(input)
+
+    // Parse
+    p := New(tokens)
+    ast := p.Parse()
+
+    // Compile
+    program := Compile(ast)
+
+    // Run
+    result := Run(program)
+
+    if result != 830 {
+        t.Errorf("got %d, want 830", result)
+    }
+}</code></pre>
+
+<p>
+  When that passes, try a few more: <code>5 + 3</code> (→&nbsp;8), <code>2 * (3 + 4)</code>
+  (→&nbsp;14), <code>42</code> (→&nbsp;42, a bare integer with no operators).
+</p>
+
+<h2>What's next</h2>
+
+<p>
+  You now have the full pipeline: source → tokens → AST → bytecode → result. The next step
+  depends on where you want to go:
+</p>
+
+<ul>
+  <li><strong>Add a disassembler</strong> — a function that prints bytecode in human-readable form.
+    Invaluable for debugging as the language grows.</li>
+  <li><strong>Grow the language</strong> — add subtraction, division, variables, or let-bindings.
+    Each one teaches you something new about bytecode design.</li>
+  <li><strong>Understand V8's model</strong> — how Ignition uses registers and an accumulator
+    instead of a stack, and what that means for your compiler.</li>
+</ul>
+
+<h2>Primary source</h2>
+
+<p>
+  Read <a href="https://craftinginterpreters.com/a-virtual-machine.html">Crafting Interpreters, Chapter 15: A Virtual Machine</a>.
+  It builds the same fetch-decode-execute loop for a richer instruction set, covers diagnostic
+  tracing (printing the stack at each step), and discusses the performance tradeoffs of different
+  dispatch strategies (switch vs. computed goto vs. direct threading).
+</p>
+
+<footer>
+  Questions about anything in this lesson? Ask your agent — that's what it's here for.
+  <br><br>
+  g8 teaching workspace &middot;
+  <a href="0001-ast-to-stack-bytecode.html">Lesson 1</a> &middot;
+  <a href="../reference/bytecode-instruction-set.html">Instruction Set Reference</a>
+</footer>
+
+<script src="../assets/stepper.js"></script>
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Lesson 1: From AST to Stack-Based Bytecode</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<h1>From AST to Stack-Based Bytecode</h1>
+<p class="lesson-meta">
+  Lesson 1 &middot; g8 bytecode compiler &middot;
+  Reference: <a href="../reference/bytecode-instruction-set.html">Instruction Set</a>
+</p>
+
+<p>
+  You have an AST. It's a tree of nodes — binary operations with children, leaf integers at the tips.
+  A tree is great for representing structure, but a machine doesn't execute trees. It executes
+  a flat sequence of instructions, one after another. <strong>Bytecode</strong> is that flat sequence.
+</p>
+
+<p>
+  The question is: how do you flatten a tree into a list, and still get the right answer?
+</p>
+
+<h2>The idea: a stack machine</h2>
+
+<p>
+  The simplest execution model is a <strong>stack machine</strong>. It has one data structure: a stack.
+  Every instruction does one of two things:
+</p>
+
+<ol>
+  <li><strong>Push</strong> a value onto the stack</li>
+  <li><strong>Pop</strong> operands, compute, push the result</li>
+</ol>
+
+<p>
+  For your grammar (integers, <code>+</code>, <code>*</code>), you need exactly three instructions:
+</p>
+
+<table class="ref-table">
+  <thead><tr><th>Instruction</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>OpPush &lt;idx&gt;</code></td><td>Push <code>constants[idx]</code> onto the stack</td></tr>
+    <tr><td><code>OpAdd</code></td><td>Pop two values, push their sum</td></tr>
+    <tr><td><code>OpMul</code></td><td>Pop two values, push their product</td></tr>
+  </tbody>
+</table>
+
+<p>
+  That's the entire instruction set. Three opcodes are enough to evaluate any expression your
+  parser can produce.
+</p>
+
+<div class="callout">
+  <strong>Why a stack?</strong> A stack machine is where almost every bytecode VM starts — the JVM,
+  CPython, WebAssembly, Lua 4. V8's Ignition uses a <em>register</em> machine instead
+  (we'll get there). But the stack model is the right first step: it's simpler, and the compilation
+  algorithm is almost trivial.
+  <br><br>
+  <em>Source:</em> <a href="https://craftinginterpreters.com/chunks-of-bytecode.html">Crafting Interpreters, Ch. 14</a>
+</div>
+
+<h2>The algorithm: post-order traversal</h2>
+
+<p>
+  Here's the key insight. Look at this AST for <code>30 + (20 * 40)</code>:
+</p>
+
+<pre><code>       ADD
+      /   \
+    30    MUL
+         /   \
+       20    40</code></pre>
+
+<p>
+  A stack machine needs operands on the stack <em>before</em> the operator runs. So you compile
+  children first, parent last. That's a <strong>post-order traversal</strong>:
+</p>
+
+<pre><code>compile(node):
+  if node is a leaf:
+    emit OpPush with the value
+  else:
+    compile(node.Left)   // left operand first
+    compile(node.Right)  // right operand second
+    emit the operator    // operator last</code></pre>
+
+<p>
+  Applied to the tree above:
+</p>
+
+<pre><code>compile(ADD)
+  compile(30)        → OpPush 0      // constants[0] = 30
+  compile(MUL)
+    compile(20)      → OpPush 1      // constants[1] = 20
+    compile(40)      → OpPush 2      // constants[2] = 40
+    emit MUL         → OpMul
+  emit ADD           → OpAdd</code></pre>
+
+<p>Final bytecode:</p>
+<pre><code>OpPush 0    // push 30
+OpPush 1    // push 20
+OpPush 2    // push 40
+OpMul       // pop 20, 40 → push 800
+OpAdd       // pop 30, 800 → push 830</code></pre>
+
+<h2>Watch it run</h2>
+
+<p>
+  Step through the bytecode below. Watch how the stack grows and shrinks.
+  Each <code>OpPush</code> adds one value; each operator consumes two and produces one.
+</p>
+
+<div class="stepper" data-steps='[
+  {"label":"OpPush 0 — push 30","stack":[30]},
+  {"label":"OpPush 1 — push 20","stack":[30,20]},
+  {"label":"OpPush 2 — push 40","stack":[30,20,40]},
+  {"label":"OpMul — pop 20,40 → push 800","stack":[30,800]},
+  {"label":"OpAdd — pop 30,800 → push 830","stack":[830]}
+]'>
+  <div class="stepper-controls">
+    <button data-prev>&larr; Prev</button>
+    <button data-next>Next &rarr;</button>
+    <span class="stepper-status">ready</span>
+  </div>
+  <div class="stepper-body">
+    <div class="stepper-instructions">
+      <div>OpPush 0</div>
+      <div>OpPush 1</div>
+      <div>OpPush 2</div>
+      <div>OpMul</div>
+      <div>OpAdd</div>
+    </div>
+    <div class="stepper-stack">
+      <div class="stepper-stack-label">Stack</div>
+    </div>
+  </div>
+</div>
+
+<h2>Why this works</h2>
+
+<p>
+  The post-order traversal preserves evaluation order. Each subtree compiles to a sequence
+  of instructions that, when executed, leaves exactly one value on the stack — the subtree's result.
+  The parent's operator instruction then consumes those results.
+</p>
+
+<p>
+  This is the <strong>stack discipline</strong>: every well-formed subtree has a net stack effect of +1.
+  Leaves push one value (+1). Binary operators push two subtrees (+2) and then pop two and push one
+  (−2 + 1 = −1), for a net of +1.
+</p>
+
+<div class="callout">
+  <strong>This is the same idea as Reverse Polish Notation.</strong> The bytecode
+  <code>30 20 40 * +</code> is literally RPN. If you've ever used an HP calculator,
+  you already know how a stack machine works.
+</div>
+
+<h2>The constant pool</h2>
+
+<p>
+  Notice that literal values don't appear in the bytecode itself. Instead, they go into a
+  separate <strong>constant pool</strong> — an array of values. The <code>OpPush</code> instruction
+  carries an index into this pool, not the value itself.
+</p>
+
+<p>
+  Why the indirection? Because bytecode instructions should be fixed-width (or at least
+  small). An integer might be 8 bytes, but a pool index is 1 byte. This keeps the instruction
+  stream compact and cache-friendly.
+</p>
+
+<p>
+  One-byte indices limit you to 256 constants per program. That's fine for now.
+  When it isn't, you add an <code>OpPushWide</code> with a 2-byte operand — same idea, more room.
+</p>
+
+<h2>Check your understanding</h2>
+
+<div class="quiz" data-correct="2"
+     data-right="Correct. Post-order: compile left (5), compile right subtree (compile 3, compile 2, emit OpMul), then emit OpAdd."
+     data-wrong="Trace the post-order traversal: left subtree first, then right subtree (recursively), then the operator.">
+  <div class="quiz-question">
+    What bytecode does <code>5 + (3 * 2)</code> compile to?
+  </div>
+  <div class="quiz-options">
+    <div class="quiz-option">OpPush 0, OpAdd, OpPush 1, OpMul, OpPush 2</div>
+    <div class="quiz-option">OpPush 0, OpPush 1, OpPush 2, OpAdd, OpMul</div>
+    <div class="quiz-option">OpPush 0, OpPush 1, OpPush 2, OpMul, OpAdd</div>
+    <div class="quiz-option">OpAdd, OpPush 0, OpMul, OpPush 1, OpPush 2</div>
+  </div>
+  <div class="quiz-feedback"></div>
+</div>
+
+<div class="quiz" data-correct="1"
+     data-right="Correct. The maximum stack depth is 3: after pushing all three constants and before any operator fires."
+     data-wrong="Trace the stack through each instruction. How tall does it get before an operator shrinks it?">
+  <div class="quiz-question">
+    What is the maximum stack depth during execution of <code>30 + (20 * 40)</code>?
+  </div>
+  <div class="quiz-options">
+    <div class="quiz-option">2</div>
+    <div class="quiz-option">3</div>
+    <div class="quiz-option">4</div>
+    <div class="quiz-option">5</div>
+  </div>
+  <div class="quiz-feedback"></div>
+</div>
+
+<h2>Now implement it</h2>
+
+<p>
+  You have everything you need. Open <code>bytecode.go</code> and build the compiler.
+  Here's the skeleton — the structure maps directly to the algorithm above:
+</p>
+
+<pre><code>type OpCode byte
+
+const (
+    OpPush OpCode = iota
+    OpAdd
+    OpMul
+)
+
+type Program struct {
+    Code      []byte
+    Constants []int
+}
+
+func Compile(node *AST) *Program {
+    p := &amp;Program{}
+    p.compile(node)
+    return p
+}
+
+func (p *Program) compile(node *AST) {
+    if node.Value != nil {
+        // Leaf: add the value to the constant pool,
+        // emit OpPush with the pool index
+        idx := len(p.Constants)
+        p.Constants = append(p.Constants, *node.Value)
+        p.Code = append(p.Code, byte(OpPush), byte(idx))
+        return
+    }
+
+    // Binary op: compile children first (post-order)
+    p.compile(node.Left)
+    p.compile(node.Right)
+
+    // Then emit the operator
+    switch node.Op {
+    case OADD:
+        p.Code = append(p.Code, byte(OpAdd))
+    case OMUL:
+        p.Code = append(p.Code, byte(OpMul))
+    }
+}</code></pre>
+
+<p>
+  Then write a test: lex <code>30 + (20 * 40)</code>, parse it, compile it, and check that
+  <code>Program.Code</code> is <code>[OpPush, 0, OpPush, 1, OpPush, 2, OpMul, OpAdd]</code>
+  and <code>Program.Constants</code> is <code>[30, 20, 40]</code>.
+</p>
+
+<div class="callout warn">
+  <strong>Don't skip the test.</strong> The compiler is simple now, but it won't stay simple.
+  A test for the compilation output is the single most useful thing you can write —
+  it will catch regressions every time you add a new node type.
+</div>
+
+<h2>What's next</h2>
+
+<p>
+  You can compile an AST to bytecode. But bytecode sitting in memory doesn't do anything —
+  you need a <strong>virtual machine</strong> to execute it. Next lesson: build a stack-based VM
+  that reads your bytecode and produces a result.
+</p>
+
+<p>
+  After that, we'll look at how V8's Ignition does it differently (registers instead of a stack,
+  an accumulator, bytecode handlers) and start thinking about what it takes to target a real V8 isolate.
+</p>
+
+<h2>Primary source</h2>
+
+<p>
+  Read <a href="https://craftinginterpreters.com/compiling-expressions.html">Crafting Interpreters, Chapter 15: Compiling Expressions</a>.
+  It covers the same AST-to-bytecode compilation for a richer language, and introduces Pratt parsing
+  as a way to merge parsing and compilation into a single pass. Your parser is already separate
+  (which is fine — most production compilers are), but the bytecode emission logic is identical.
+</p>
+
+<footer>
+  Questions about anything in this lesson? Ask your agent — that's what it's here for.
+  <br><br>
+  g8 teaching workspace &middot; <a href="../reference/bytecode-instruction-set.html">Instruction Set Reference</a>
+</footer>
+
+<script src="../assets/stepper.js"></script>
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

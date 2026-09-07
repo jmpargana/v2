@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>g8 Bytecode Instruction Set Reference</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<h1>g8 Bytecode Instruction Set</h1>
+<p class="lesson-meta">Reference &middot; Stack-based VM &middot; v0.1 (arithmetic only)</p>
+
+<h2>Execution Model</h2>
+<p>
+  g8 uses a <strong>stack machine</strong>. There are no named registers.
+  Every instruction either pushes a value onto the stack or pops values, computes, and pushes the result.
+  After a program finishes, the result is the single value remaining on the stack.
+</p>
+
+<h2>Instruction Format</h2>
+<p>
+  Each instruction is one byte (the <strong>opcode</strong>), optionally followed by operand bytes.
+  Operands are encoded as indices into a <strong>constant pool</strong> — an array of literal values
+  attached to the bytecode program.
+</p>
+
+<h2>Opcodes</h2>
+<table class="ref-table">
+  <thead>
+    <tr>
+      <th>Opcode</th>
+      <th>Byte</th>
+      <th>Operands</th>
+      <th>Stack effect</th>
+      <th>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>OpPush</code></td>
+      <td><code>0x00</code></td>
+      <td>1 byte (constant pool index)</td>
+      <td>[] &rarr; [value]</td>
+      <td>Push <code>constants[operand]</code> onto the stack.</td>
+    </tr>
+    <tr>
+      <td><code>OpAdd</code></td>
+      <td><code>0x01</code></td>
+      <td>none</td>
+      <td>[a, b] &rarr; [a+b]</td>
+      <td>Pop two values, push their sum.</td>
+    </tr>
+    <tr>
+      <td><code>OpMul</code></td>
+      <td><code>0x02</code></td>
+      <td>none</td>
+      <td>[a, b] &rarr; [a&times;b]</td>
+      <td>Pop two values, push their product.</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2>Constant Pool</h2>
+<p>
+  The constant pool is an <code>[]int</code> array. When the compiler encounters a literal integer
+  in the AST, it appends the value to the pool and emits an <code>OpPush</code> instruction
+  with the pool index as the operand.
+</p>
+
+<h2>Compilation Rule</h2>
+<p>
+  The compiler performs a <strong>post-order traversal</strong> of the AST:
+</p>
+<pre><code>compile(node):
+  if node is a leaf (Value != nil):
+    idx = addConstant(node.Value)
+    emit(OpPush, idx)
+  else:
+    compile(node.Left)
+    compile(node.Right)
+    emit(opFor(node.Op))  // OpAdd or OpMul</code></pre>
+
+<h2>Example</h2>
+<p>Source: <code>30 + (20 * 40)</code></p>
+<pre><code>Constants: [30, 20, 40]
+
+Bytecode:
+  OpPush 0    // push 30
+  OpPush 1    // push 20
+  OpPush 2    // push 40
+  OpMul       // 20 * 40 = 800
+  OpAdd       // 30 + 800 = 830</code></pre>
+
+<h2>Go Representation</h2>
+<pre><code>type OpCode byte
+
+const (
+    OpPush OpCode = iota
+    OpAdd
+    OpMul
+)
+
+type Program struct {
+    Code      []byte
+    Constants []int
+}</code></pre>
+
+<h2>VM Execution</h2>
+<p>
+  The VM is a fetch-decode-execute loop with three pieces of state:
+  an instruction pointer (<code>ip</code>), a value stack, and the program.
+</p>
+<pre><code>type VM struct {
+    ip    int
+    stack []int
+}
+
+func Run(program *Program) int {
+    vm := &amp;VM{}
+    for vm.ip &lt; len(program.Code) {
+        op := OpCode(program.Code[vm.ip])
+        vm.ip++
+        switch op {
+        case OpPush:
+            idx := program.Code[vm.ip]
+            vm.ip++
+            vm.push(program.Constants[idx])
+        case OpAdd:
+            b, a := vm.pop(), vm.pop()
+            vm.push(a + b)
+        case OpMul:
+            b, a := vm.pop(), vm.pop()
+            vm.push(a * b)
+        }
+    }
+    return vm.pop()
+}</code></pre>
+
+<footer>
+  g8 teaching workspace &middot;
+  <a href="../lessons/0001-ast-to-stack-bytecode.html">Lesson 1</a> &middot;
+  <a href="../lessons/0002-building-the-vm.html">Lesson 2</a>
+</footer>
+
+</body>
+</html>
