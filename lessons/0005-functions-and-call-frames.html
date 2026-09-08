@@ -1,0 +1,532 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Lesson 5: Functions and Call Frames</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<h1>Functions and Call Frames</h1>
+<p class="lesson-meta">
+  Lesson 5 &middot; g8 bytecode compiler &middot;
+  Prev: <a href="0004-variables.html">Variables</a> &middot;
+  Reference: <a href="../reference/bytecode-instruction-set.html">Instruction Set</a>
+</p>
+
+<p>
+  Right now your VM has one instruction pointer, one register file, and runs one flat program.
+  Functions break all three of those assumptions. A function call means: pause what you're doing,
+  start executing different bytecode with fresh registers, then come back.
+</p>
+
+<p>
+  The structure that makes this work is a <strong>call frame</strong>.
+</p>
+
+<h2>What changes</h2>
+
+<h3>Each function gets its own bytecode</h3>
+
+<p>
+  When you compile <code>function add(a, b) { return a + b; }</code>, the body compiles to
+  its own separate bytecode — its own <code>code []byte</code>, its own <code>cons []int</code>,
+  and its own register numbering starting from 0. It's essentially a mini-<code>Program</code>.
+</p>
+
+<p>
+  The function's parameters are assigned to the first registers: <code>a</code> → <code>r0</code>,
+  <code>b</code> → <code>r1</code>. The body compiles against those bindings. From the function's
+  perspective, it's the same compilation you've already built — the only difference is that
+  some registers are pre-populated with argument values instead of being empty.
+</p>
+
+<h3>The call stack</h3>
+
+<p>
+  The VM no longer has a single <code>ip</code> and a single register file. Instead it has a
+  <strong>stack of call frames</strong>. Each frame holds:
+</p>
+
+<table class="ref-table">
+  <thead><tr><th>Field</th><th>What it is</th></tr></thead>
+  <tbody>
+    <tr><td><code>bytecode</code></td><td>Pointer to the function's bytecode (code + constants)</td></tr>
+    <tr><td><code>ip</code></td><td>Instruction pointer within <em>this</em> function's code</td></tr>
+    <tr><td><code>regs</code></td><td>This function's register file — parameters + locals + temporaries</td></tr>
+  </tbody>
+</table>
+
+<p>
+  The VM always executes from the <strong>top frame</strong>. When it reads an opcode, it reads
+  from the top frame's bytecode at the top frame's <code>ip</code>. When it accesses a register,
+  it's the top frame's register file.
+</p>
+
+<h3>Two new opcodes</h3>
+
+<table class="ref-table">
+  <thead><tr><th>Opcode</th><th>Operands</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><code>OpCall</code></td>
+      <td><code>func_idx</code>, <code>arg_count</code></td>
+      <td>
+        Push a new call frame for the function. Copy argument values from the
+        caller's registers into the callee's <code>r0</code>, <code>r1</code>, &hellip;
+        Start executing the function's bytecode.
+      </td>
+    </tr>
+    <tr>
+      <td><code>OpReturn</code></td>
+      <td>none</td>
+      <td>
+        Pop the current call frame. The return value is in the accumulator — it
+        survives the frame pop. The caller resumes execution with the result in <code>acc</code>.
+      </td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="callout">
+  <strong>V8 does this too.</strong> Each JavaScript function compiles to its own Ignition bytecode.
+  <code>CallUndefinedReceiver</code> pushes a frame; <code>Return</code> pops it. Arguments are
+  passed in consecutive registers. The accumulator holds the return value.
+  <br><br>
+  <em>Source:</em> V8's <a href="https://chromium.googlesource.com/v8/v8/+/refs/heads/main/src/interpreter/bytecodes.h">bytecodes.h</a>
+</div>
+
+<h2>Worked example</h2>
+
+<p>Source:</p>
+<pre><code>function add(a, b) {
+    return a + b;
+}
+let result = add(10, 20);</code></pre>
+
+<h3>Step 1: Compile the function body</h3>
+
+<p>
+  The function <code>add</code> gets its own bytecode. Parameters <code>a</code> and <code>b</code>
+  are pre-assigned to <code>r0</code> and <code>r1</code>:
+</p>
+
+<pre><code>// add's bytecode (func index 0)
+// symbols: {"a": 0, "b": 1}, nextReg starts at 2
+
+Ldar   r0         // acc = a
+Star   r2         // r2 = a (temp stash for +)
+Ldar   r1         // acc = b
+Add    r2         // acc = r2 + acc = a + b
+Return            // return acc to caller</code></pre>
+
+<h3>Step 2: Compile the main program</h3>
+
+<p>
+  The <code>FuncDecl</code> doesn't emit any bytecode in the main program — it just registers
+  the compiled function in a table. The call site compiles each argument, stashes them in
+  consecutive registers, then emits <code>OpCall</code>:
+</p>
+
+<pre><code>// main program bytecode
+// funcs[0] = add's bytecode
+
+// let result = add(10, 20);
+
+// Compile arg 0:
+LdaSmi [0]        // acc = 10
+Star   r0         // r0 = 10 (arg 0)
+
+// Compile arg 1:
+LdaSmi [1]        // acc = 20
+Star   r1         // r1 = 20 (arg 1)
+
+// Call:
+Call   0, 2       // call funcs[0] with 2 args from r0,r1
+                  // → pushes new frame, copies r0→callee.r0, r1→callee.r1
+                  // → executes add's bytecode
+                  // → Return pops frame, acc = 30
+
+// Store result:
+Star   r2         // r2 = 30
+                  // symbols["result"] = 2
+
+Constants: [10, 20]</code></pre>
+
+<h2>Watch it run</h2>
+
+<div class="stepper" data-steps='[
+  {"label":"[main] LdaSmi [0] — acc = 10","stack":[]},
+  {"label":"[main] Star r0 — r0 = 10 (arg 0 for add)","stack":[]},
+  {"label":"[main] LdaSmi [1] — acc = 20","stack":[]},
+  {"label":"[main] Star r1 — r1 = 20 (arg 1 for add)","stack":[]},
+  {"label":"[main] Call 0, 2 — push frame for add(10, 20)","stack":[]},
+  {"label":"[add] Ldar r0 — acc = 10 (param a)","stack":[]},
+  {"label":"[add] Star r2 — r2 = 10 (temp for +)","stack":[]},
+  {"label":"[add] Ldar r1 — acc = 20 (param b)","stack":[]},
+  {"label":"[add] Add r2 — acc = 10 + 20 = 30","stack":[]},
+  {"label":"[add] Return — pop frame, acc = 30","stack":[]},
+  {"label":"[main] Star r2 — r2 = 30 (result)","stack":[]}
+]'>
+  <div class="stepper-controls">
+    <button data-prev>&larr; Prev</button>
+    <button data-next>Next &rarr;</button>
+    <span class="stepper-status">ready</span>
+  </div>
+  <div class="stepper-body">
+    <div class="stepper-instructions">
+      <div><code style="color:var(--muted)">// main</code></div>
+      <div>LdaSmi [0]</div>
+      <div>Star r0</div>
+      <div>LdaSmi [1]</div>
+      <div>Star r1</div>
+      <div>Call 0, 2</div>
+      <div><code style="color:var(--muted)">// inside add</code></div>
+      <div>Ldar r0</div>
+      <div>Star r2</div>
+      <div>Ldar r1</div>
+      <div>Add r2</div>
+      <div>Return</div>
+      <div><code style="color:var(--muted)">// back in main</code></div>
+      <div>Star r2</div>
+    </div>
+    <div class="stepper-registers" style="min-width:200px; font-family:var(--font-mono); font-size:0.82rem;">
+      <div class="stepper-stack-label">State</div>
+      <div id="reg-display" style="line-height:1.8;"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+document.addEventListener('DOMContentLoaded', () => {
+  const states = [
+    {frame:'main', acc:10, regs:{'r0':'—','r1':'—','r2':'—'}, depth:1},
+    {frame:'main', acc:10, regs:{'r0':10,'r1':'—','r2':'—'}, depth:1},
+    {frame:'main', acc:20, regs:{'r0':10,'r1':'—','r2':'—'}, depth:1},
+    {frame:'main', acc:20, regs:{'r0':10,'r1':20,'r2':'—'}, depth:1},
+    {frame:'→ add', acc:20, regs:{'r0':'10 (a)','r1':'20 (b)','r2':'—'}, depth:2},
+    {frame:'add', acc:10, regs:{'r0':'10 (a)','r1':'20 (b)','r2':'—'}, depth:2},
+    {frame:'add', acc:10, regs:{'r0':'10 (a)','r1':'20 (b)','r2':10}, depth:2},
+    {frame:'add', acc:20, regs:{'r0':'10 (a)','r1':'20 (b)','r2':10}, depth:2},
+    {frame:'add', acc:30, regs:{'r0':'10 (a)','r1':'20 (b)','r2':10}, depth:2},
+    {frame:'← main', acc:30, regs:{'r0':10,'r1':20,'r2':'—'}, depth:1},
+    {frame:'main', acc:30, regs:{'r0':10,'r1':20,'r2':30}, depth:1},
+  ];
+  const stepper = document.querySelector('.stepper');
+  const regDisplay = document.getElementById('reg-display');
+  const steps = JSON.parse(stepper.dataset.steps);
+  const instrLines = stepper.querySelectorAll('.stepper-instructions div');
+  const commentIndices = [0,6,12];
+  const instrIndices = [1,2,3,4,5,7,8,9,10,11,13];
+  const status = stepper.querySelector('.stepper-status');
+  const prevBtn = stepper.querySelector('[data-prev]');
+  const nextBtn = stepper.querySelector('[data-next]');
+  let current = -1;
+
+  function render() {
+    instrIndices.forEach((lineIdx, stepIdx) => {
+      const line = instrLines[lineIdx];
+      line.classList.remove('active','done');
+      if (stepIdx === current) line.classList.add('active');
+      else if (stepIdx < current) line.classList.add('done');
+    });
+    if (current >= 0 && current < states.length) {
+      const s = states[current];
+      let html = '<div><strong>frame</strong>: ' + s.frame + ' (depth ' + s.depth + ')</div>';
+      html += '<div><strong>acc</strong> = ' + s.acc + '</div>';
+      for (const [k,v] of Object.entries(s.regs)) {
+        html += '<div>' + k + ' = ' + v + '</div>';
+      }
+      regDisplay.innerHTML = html;
+    } else {
+      regDisplay.innerHTML = '<div><strong>frame</strong>: main (depth 1)</div><div><strong>acc</strong> = —</div><div>r0 = —</div><div>r1 = —</div><div>r2 = —</div>';
+    }
+    status.textContent = current < 0 ? 'ready' : current < steps.length ? steps[current].label : 'done';
+    prevBtn.disabled = current < 0;
+    nextBtn.disabled = current >= steps.length - 1;
+  }
+
+  prevBtn.addEventListener('click', () => { if (current > -1) { current--; render(); } });
+  nextBtn.addEventListener('click', () => { if (current < steps.length - 1) { current++; render(); } });
+  render();
+});
+</script>
+
+<h2>The argument passing convention</h2>
+
+<p>
+  When compiling a call expression like <code>add(10, 20)</code>, the compiler:
+</p>
+
+<ol>
+  <li>Compiles each argument expression in order</li>
+  <li>Stars each result into a consecutive register (<code>r0</code>, <code>r1</code>, &hellip;)</li>
+  <li>Emits <code>OpCall &lt;func_idx&gt; &lt;arg_count&gt;</code></li>
+</ol>
+
+<p>
+  The VM then copies those registers from the caller's frame into the callee's
+  <code>r0</code>, <code>r1</code>, &hellip; — matching the parameter order. The callee's
+  compiler already assigned <code>a</code> → <code>r0</code>, <code>b</code> → <code>r1</code>,
+  so the values land in the right place.
+</p>
+
+<div class="callout warn">
+  <strong>Where do the argument registers come from?</strong> The simplest approach: the compiler
+  records the first register used for arguments. Since <code>allocReg()</code> is sequential,
+  if you allocate <code>arg_count</code> registers right before the call, they'll be consecutive.
+  Pass the starting register as part of <code>OpCall</code>, or let the VM infer it from
+  <code>arg_count</code> (the last N allocated registers).
+</div>
+
+<h2>Data structures</h2>
+
+<p>Here's what changes in your codebase:</p>
+
+<h3>A function bytecode type</h3>
+
+<pre><code>type FuncBytecode struct {
+    Code       []byte
+    Cons       []int
+    ParamCount int
+}</code></pre>
+
+<p>
+  This is the compiled form of a function. It's like a <code>Program</code> but
+  without the symbol table (that's only needed during compilation). The main program
+  holds a slice of these:
+</p>
+
+<pre><code>type Program struct {
+    code    []byte
+    cons    []int
+    funcs   []*FuncBytecode  // compiled functions
+    nextReg int
+    symbols map[string]int
+}</code></pre>
+
+<h3>Call frames in the VM</h3>
+
+<pre><code>type CallFrame struct {
+    bytecode *FuncBytecode
+    ip       int
+    regs     [256]int
+}
+
+type VM struct {
+    acc    int
+    frames []CallFrame  // call stack
+}</code></pre>
+
+<p>
+  The VM always operates on the top frame: <code>frames[len(frames)-1]</code>.
+  The accumulator is <strong>shared across frames</strong> — it doesn't get saved/restored.
+  This is how V8 does it: <code>Return</code> simply leaves the value in <code>acc</code>,
+  and the caller picks it up from there.
+</p>
+
+<h3>The FDE loop</h3>
+
+<pre><code>func (vm *VM) FDE() int {
+    for len(vm.frames) > 0 {
+        frame := &amp;vm.frames[len(vm.frames)-1]
+
+        if frame.ip >= len(frame.bytecode.Code) {
+            // implicit return at end of function
+            vm.frames = vm.frames[:len(vm.frames)-1]
+            continue
+        }
+
+        op := ByteCode(frame.bytecode.Code[frame.ip])
+        frame.ip++
+
+        switch op {
+        case OpLdaSmi:
+            idx := frame.bytecode.Code[frame.ip]
+            frame.ip++
+            vm.acc = frame.bytecode.Cons[idx]
+
+        case OpStar:
+            r := frame.bytecode.Code[frame.ip]
+            frame.ip++
+            frame.regs[r] = vm.acc
+
+        case OpLdar:
+            r := frame.bytecode.Code[frame.ip]
+            frame.ip++
+            vm.acc = frame.regs[r]
+
+        case OpAdd:
+            r := frame.bytecode.Code[frame.ip]
+            frame.ip++
+            vm.acc = frame.regs[r] + vm.acc
+
+        case OpMul:
+            r := frame.bytecode.Code[frame.ip]
+            frame.ip++
+            vm.acc = frame.regs[r] * vm.acc
+
+        case OpCall:
+            funcIdx := frame.bytecode.Code[frame.ip]
+            frame.ip++
+            argCount := frame.bytecode.Code[frame.ip]
+            frame.ip++
+
+            fn := // ... look up the function bytecode
+            newFrame := CallFrame{bytecode: fn}
+            // Copy args: caller's last N registers → callee's r0..rN-1
+            for i := 0; i &lt; int(argCount); i++ {
+                newFrame.regs[i] = frame.regs[/* arg register */]
+            }
+            vm.frames = append(vm.frames, newFrame)
+
+        case OpReturn:
+            // acc already holds the return value
+            vm.frames = vm.frames[:len(vm.frames)-1]
+        }
+    }
+    return vm.acc
+}</code></pre>
+
+<h2>How the compiler changes</h2>
+
+<h3>Compiling FuncDecl</h3>
+
+<p>A function declaration doesn't emit bytecode in the main program. Instead it:</p>
+<ol>
+  <li>Creates a fresh compilation context (new <code>code</code>, <code>cons</code>, <code>symbols</code>, <code>nextReg</code>)</li>
+  <li>Pre-assigns each parameter to a register: <code>symbols["a"] = 0, symbols["b"] = 1, nextReg = 2</code></li>
+  <li>Compiles the function body's statements</li>
+  <li>Wraps it in a <code>FuncBytecode</code> and appends to <code>program.funcs</code></li>
+  <li>Records the function's index so <code>CallExpr</code> can reference it:
+    <code>symbols["add"] = funcIndex</code> (or use a separate <code>funcTable map[string]int</code>)</li>
+</ol>
+
+<h3>Compiling CallExpr</h3>
+
+<pre><code>case *CallExpr:
+    // Compile each argument, stash in consecutive registers
+    firstReg := p.nextReg
+    for _, arg := range expr.Args {
+        p.CompileExpr(arg)
+        reg := p.allocReg()
+        p.code = append(p.code, byte(OpStar), byte(reg))
+    }
+    // Emit the call
+    funcIdx := p.funcTable[expr.Func]
+    p.code = append(p.code, byte(OpCall), byte(funcIdx), byte(len(expr.Args)))
+    // After call: result is in accumulator</code></pre>
+
+<h3>Compiling ReturnStmt</h3>
+
+<pre><code>case *ReturnStmt:
+    p.CompileExpr(stmt.Value)
+    p.code = append(p.code, byte(OpReturn))</code></pre>
+
+<h2>Check your understanding</h2>
+
+<div class="quiz" data-correct="0"
+     data-right="Correct. The accumulator is shared — it's not part of the call frame. Return leaves the value in acc, and the caller reads it from acc. No copying needed."
+     data-wrong="Think about what OpReturn does: it pops the call frame. What stays the same across frames?">
+  <div class="quiz-question">
+    How does the return value get from the callee back to the caller?
+  </div>
+  <div class="quiz-options">
+    <div class="quiz-option">The accumulator is shared across frames</div>
+    <div class="quiz-option">The VM copies it into the caller's register</div>
+    <div class="quiz-option">The return value is pushed onto the stack</div>
+    <div class="quiz-option">The caller re-reads the callee's register</div>
+  </div>
+  <div class="quiz-feedback"></div>
+</div>
+
+<div class="quiz" data-correct="1"
+     data-right="Correct. Parameters are pre-assigned to the first N registers (r0, r1, ...). The remaining registers are available for locals and temporaries, numbered from rN onward."
+     data-wrong="Think about how the compiler sets up a function body. Where does nextReg start?">
+  <div class="quiz-question">
+    A function has 3 parameters. What register does the first local variable get?
+  </div>
+  <div class="quiz-options">
+    <div class="quiz-option">r0</div>
+    <div class="quiz-option">r3</div>
+    <div class="quiz-option">r1</div>
+    <div class="quiz-option">r256</div>
+  </div>
+  <div class="quiz-feedback"></div>
+</div>
+
+<h2>Now implement it</h2>
+
+<p>This is the biggest change yet. Take it in stages and test each one:</p>
+
+<ol>
+  <li>
+    <strong>Add the data structures:</strong> <code>FuncBytecode</code>, <code>CallFrame</code>,
+    the <code>funcs</code> slice on <code>Program</code>. Add <code>OpCall</code> and
+    <code>OpReturn</code> to your opcode enum and disassembler.
+  </li>
+  <li>
+    <strong>Compile a simple function:</strong> Test that <code>function add(a, b) { return a + b; }</code>
+    produces the right bytecode with <code>a=r0, b=r1</code>.
+  </li>
+  <li>
+    <strong>Compile a call:</strong> Test that <code>add(10, 20)</code> emits argument loads,
+    stars, and <code>OpCall</code>.
+  </li>
+  <li>
+    <strong>Update the VM:</strong> Replace the single <code>ip</code>/<code>regs</code> with
+    a frame stack. Add <code>OpCall</code> and <code>OpReturn</code> handlers.
+  </li>
+  <li>
+    <strong>End-to-end test:</strong>
+    <code>function add(a, b) { return a + b; } let result = add(10, 20);</code> → <code>acc = 30</code>.
+  </li>
+</ol>
+
+<div class="callout warn">
+  <strong>Design decision: where do functions live?</strong> You need a way for
+  <code>OpCall</code> in the main bytecode to find the function's <code>FuncBytecode</code>.
+  Simplest approach: store them in a <code>funcs []*FuncBytecode</code> on the program, and
+  <code>OpCall</code>'s operand is an index into that slice. You also need a way for the VM
+  to find the slice — either pass it to <code>FDE</code> or store it on the VM.
+</div>
+
+<h2>What's next</h2>
+
+<p>
+  With functions, your language is Turing-complete (given recursion). Future directions:
+</p>
+
+<ul>
+  <li><strong>Recursion</strong> — it already works if your call stack handles it, but test it
+    with factorial or Fibonacci</li>
+  <li><strong>Closures</strong> — functions that capture variables from their enclosing scope
+    (requires context objects, like V8's <code>LdaContextSlot</code>)</li>
+  <li><strong>V8 embedding</strong> — now that you have a complete mental model of how bytecode
+    VMs work, you can start looking at <code>v8go</code> and real V8 isolates</li>
+</ul>
+
+<h2>Primary source</h2>
+
+<p>
+  Read <a href="https://craftinginterpreters.com/calls-and-functions.html">Crafting Interpreters, Ch. 24: Calls and Functions</a>.
+  It builds exactly this: separate bytecode per function, call frames, a call stack, parameter
+  passing. The main difference from your design is that clox uses a stack-based VM, so arguments
+  are passed on the value stack rather than in registers — but the call frame concept is identical.
+</p>
+
+<footer>
+  Questions about anything in this lesson? Ask your agent — that's what it's here for.
+  <br><br>
+  g8 teaching workspace &middot;
+  <a href="0001-ast-to-stack-bytecode.html">Lesson 1</a> &middot;
+  <a href="0002-building-the-vm.html">Lesson 2</a> &middot;
+  <a href="0003-the-accumulator-model.html">Lesson 3</a> &middot;
+  <a href="0004-variables.html">Lesson 4</a> &middot;
+  <a href="../reference/bytecode-instruction-set.html">Instruction Set Reference</a>
+</footer>
+
+<script src="../assets/quiz.js"></script>
+</body>
+</html>
