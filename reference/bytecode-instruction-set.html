@@ -9,7 +9,7 @@
 <body>
 
 <h1>g8 Bytecode Instruction Set</h1>
-<p class="lesson-meta">Reference &middot; Stack-based VM &middot; v0.1 (arithmetic only)</p>
+<p class="lesson-meta">Reference &middot; Stack + Register VMs &middot; v0.2 (arithmetic only)</p>
 
 <h2>Execution Model</h2>
 <p>
@@ -137,10 +137,113 @@ func Run(program *Program) int {
     return vm.pop()
 }</code></pre>
 
+<hr>
+
+<h1 id="register">Register-Based (Accumulator) Instruction Set</h1>
+
+<h2>Execution Model</h2>
+<p>
+  The accumulator model uses one implicit register (<strong>acc</strong>) and a register file
+  (<code>r0</code>, <code>r1</code>, &hellip;). Most operations read/write the accumulator implicitly.
+  No stack. The final result is in the accumulator when the program finishes.
+</p>
+
+<h2>Opcodes</h2>
+<table class="ref-table">
+  <thead>
+    <tr>
+      <th>Opcode</th>
+      <th>Byte</th>
+      <th>Operands</th>
+      <th>Effect</th>
+      <th>V8 equivalent</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>OpLdaSmi</code></td>
+      <td><code>0x10</code></td>
+      <td>1 byte (immediate value)</td>
+      <td><code>acc = imm</code></td>
+      <td><code>LdaSmi</code></td>
+    </tr>
+    <tr>
+      <td><code>OpStar</code></td>
+      <td><code>0x11</code></td>
+      <td>1 byte (register index)</td>
+      <td><code>regs[r] = acc</code></td>
+      <td><code>Star</code></td>
+    </tr>
+    <tr>
+      <td><code>OpLdar</code></td>
+      <td><code>0x12</code></td>
+      <td>1 byte (register index)</td>
+      <td><code>acc = regs[r]</code></td>
+      <td><code>Ldar</code></td>
+    </tr>
+    <tr>
+      <td><code>OpRegAdd</code></td>
+      <td><code>0x13</code></td>
+      <td>1 byte (register index)</td>
+      <td><code>acc = regs[r] + acc</code></td>
+      <td><code>Add</code></td>
+    </tr>
+    <tr>
+      <td><code>OpRegMul</code></td>
+      <td><code>0x14</code></td>
+      <td>1 byte (register index)</td>
+      <td><code>acc = regs[r] * acc</code></td>
+      <td><code>Mul</code></td>
+    </tr>
+  </tbody>
+</table>
+
+<h2>Compilation Rule</h2>
+<pre><code>compile(node):
+  if node is a leaf:
+    emit(LdaSmi, node.Value)       // acc = value
+  else:
+    compile(node.Left)              // acc = left result
+    reg = allocRegister()
+    emit(Star, reg)                 // stash left in register
+    compile(node.Right)             // acc = right result
+    emit(opFor(node.Op), reg)       // acc = reg ○ acc</code></pre>
+
+<h2>Example</h2>
+<p>Source: <code>30 + (20 * 40)</code></p>
+<pre><code>LdaSmi 30     // acc = 30
+Star   r0     // r0 = 30
+LdaSmi 20     // acc = 20
+Star   r1     // r1 = 20
+LdaSmi 40     // acc = 40
+Mul    r1     // acc = 20 * 40 = 800
+Add    r0     // acc = 30 + 800 = 830</code></pre>
+
+<h2>Go Representation</h2>
+<pre><code>const (
+    OpLdaSmi  OpCode = 0x10
+    OpStar    OpCode = 0x11
+    OpLdar    OpCode = 0x12
+    OpRegAdd  OpCode = 0x13
+    OpRegMul  OpCode = 0x14
+)
+
+type RegProgram struct {
+    Code    []byte
+    nextReg byte
+}
+
+type RegVM struct {
+    ip   int
+    acc  int
+    regs [256]int
+}</code></pre>
+
 <footer>
   g8 teaching workspace &middot;
   <a href="../lessons/0001-ast-to-stack-bytecode.html">Lesson 1</a> &middot;
-  <a href="../lessons/0002-building-the-vm.html">Lesson 2</a>
+  <a href="../lessons/0002-building-the-vm.html">Lesson 2</a> &middot;
+  <a href="../lessons/0003-the-accumulator-model.html">Lesson 3</a>
 </footer>
 
 </body>

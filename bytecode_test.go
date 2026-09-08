@@ -24,14 +24,20 @@ func TestProgram_Compile(t *testing.T) {
 			},
 			&Program{
 				code: []byte{
-					byte(OpPush),
+					byte(OpLdaSmi),
 					byte(0),
-					byte(OpPush),
+					byte(OpStar),
+					byte(0),
+					byte(OpLdaSmi),
 					byte(1),
-					byte(OpPush),
+					byte(OpStar),
+					byte(1),
+					byte(OpLdaSmi),
 					byte(2),
 					byte(OpAdd),
+					byte(1),
 					byte(OpMul),
+					byte(0),
 				},
 				cons: []int{1, 2, 3},
 			},
@@ -42,9 +48,8 @@ func TestProgram_Compile(t *testing.T) {
 			// TODO: construct the receiver type.
 			var p Program
 			got := p.Compile(tt.ast)
-			// TODO: update the condition below to compare got with tt.want.
 			if !got.Equals(tt.want) {
-				t.Errorf("Compile() = %v, want %v", got, tt.want)
+				t.Errorf("Compile() mismatch for AST: %s\ngot:\n%s\nwant:\n%s", tt.ast, got, tt.want)
 			}
 		})
 	}

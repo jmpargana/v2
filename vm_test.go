@@ -33,9 +33,8 @@ func TestVM_FDE(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			vm := Start()
 			got := vm.FDE(tt.program)
-			// TODO: update the condition below to compare got with tt.want.
 			if got != tt.want {
-				t.Errorf("FDE() = %v, want %v", got, tt.want)
+				t.Errorf("FDE() = %d, want %d\nprogram:\n%svm state:\n%s", got, tt.want, &tt.program, vm)
 			}
 		})
 	}

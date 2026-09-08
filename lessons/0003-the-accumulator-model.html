@@ -1,0 +1,431 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Lesson 3: The Accumulator Model</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<h1>The Accumulator Model</h1>
+<p class="lesson-meta">
+  Lesson 3 &middot; g8 bytecode compiler &middot;
+  Prev: <a href="0002-building-the-vm.html">Building the VM</a> &middot;
+  Reference: <a href="../reference/bytecode-instruction-set.html">Instruction Set</a>
+</p>
+
+<p>
+  Your stack machine works. But V8 doesn't use a stack machine. It uses a
+  <strong>register machine with an accumulator</strong>. This lesson explains why,
+  what that means, and how to convert your compiler and VM to use it.
+</p>
+
+<h2>The problem with stacks</h2>
+
+<p>
+  Look at your bytecode for <code>30 + (20 * 40)</code>:
+</p>
+
+<pre><code>OpPush 0    // push 30
+OpPush 1    // push 20
+OpPush 2    // push 40
+OpMul       // pop 20, pop 40, push 800
+OpAdd       // pop 30, pop 800, push 830</code></pre>
+
+<p>
+  Every value passes through the stack. The value <code>30</code> is pushed, then sits there
+  doing nothing while the multiplication happens, then gets popped for the addition.
+  That's three memory operations (push, idle, pop) for a value that just needs to wait.
+</p>
+
+<p>
+  In a more complex expression, this gets worse. Values get pushed and popped repeatedly
+  as they flow through nested subexpressions. Each push/pop is a memory access — and memory
+  is slow compared to registers.
+</p>
+
+<p>
+  The bigger issue: <strong>a stack is opaque to the optimizer.</strong> If you wanted to optimize
+  the bytecode later (reorder instructions, eliminate redundant operations), everything is
+  implicit — you can't look at an instruction and know which value it operates on without
+  simulating the entire stack up to that point.
+</p>
+
+<h2>The register idea</h2>
+
+<p>
+  A register machine names its temporaries. Instead of pushing onto an anonymous stack,
+  you say <em>which</em> register holds each value:
+</p>
+
+<pre><code>Load  r0, 30      // r0 = 30
+Load  r1, 20      // r1 = 20
+Load  r2, 40      // r2 = 40
+Mul   r1, r1, r2  // r1 = r1 * r2 = 800
+Add   r0, r0, r1  // r0 = r0 + r1 = 830</code></pre>
+
+<p>
+  Now every instruction says exactly what it reads and writes. No implicit state.
+  An optimizer can see that <code>r0</code> isn't touched by the <code>Mul</code>, so it could
+  freely reorder things.
+</p>
+
+<p>
+  The tradeoff: instructions are bigger (three register operands per binary op), and the
+  compiler needs a <strong>register allocator</strong> — it has to decide which register
+  holds which value.
+</p>
+
+<h2>V8's compromise: the accumulator</h2>
+
+<p>
+  V8's Ignition interpreter doesn't go full three-address register machine. Instead it uses
+  a hybrid: <strong>one special register (the accumulator) is implicit in most instructions</strong>.
+  Binary operations read one operand from a named register and the other from the accumulator,
+  and write the result back to the accumulator.
+</p>
+
+<p>
+  This means most instructions only need to encode <em>one</em> register operand instead of
+  three — keeping bytecode compact — while still giving you named storage for values that
+  need to wait.
+</p>
+
+<p>Here are the key V8 bytecodes (simplified for your grammar):</p>
+
+<table class="ref-table">
+  <thead><tr><th>Bytecode</th><th>Operation</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><code>LdaSmi &lt;imm&gt;</code></td>
+      <td><code>acc = imm</code></td>
+      <td>Load a small integer into the accumulator</td>
+    </tr>
+    <tr>
+      <td><code>Star &lt;reg&gt;</code></td>
+      <td><code>reg = acc</code></td>
+      <td>Store the accumulator into a register</td>
+    </tr>
+    <tr>
+      <td><code>Ldar &lt;reg&gt;</code></td>
+      <td><code>acc = reg</code></td>
+      <td>Load a register into the accumulator</td>
+    </tr>
+    <tr>
+      <td><code>Add &lt;reg&gt;</code></td>
+      <td><code>acc = reg + acc</code></td>
+      <td>Add register to accumulator</td>
+    </tr>
+    <tr>
+      <td><code>Mul &lt;reg&gt;</code></td>
+      <td><code>acc = reg * acc</code></td>
+      <td>Multiply register by accumulator</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="callout">
+  <strong>Where's <code>OpPush</code>?</strong> Gone. There is no stack to push onto.
+  Values live in the accumulator or in named registers. The accumulator replaces the
+  top-of-stack as the "current working value."
+  <br><br>
+  <em>Source:</em> V8's <a href="https://chromium.googlesource.com/v8/v8/+/refs/heads/main/src/interpreter/bytecodes.h">bytecodes.h</a>
+  and the <a href="https://v8.dev/blog/ignition-interpreter">Ignition blog post</a>
+</div>
+
+<h2>Your expression, accumulator-style</h2>
+
+<p>
+  Let's compile <code>30 + (20 * 40)</code> to accumulator bytecode.
+  The trick: when you need a value to survive past the next operation, stash it in a register
+  with <code>Star</code>. Otherwise, let it ride in the accumulator.
+</p>
+
+<pre><code>LdaSmi 30     // acc = 30
+Star   r0     // r0 = 30  (stash — we need 30 later)
+LdaSmi 20     // acc = 20
+Star   r1     // r1 = 20  (stash — Mul needs it in a register)
+LdaSmi 40     // acc = 40
+Mul    r1     // acc = r1 * acc = 20 * 40 = 800
+Add    r0     // acc = r0 + acc = 30 + 800 = 830</code></pre>
+
+<p>Compare to the stack version (5 instructions, stack depth 3):</p>
+
+<pre><code>OpPush 0, OpPush 1, OpPush 2, OpMul, OpAdd</code></pre>
+
+<p>
+  The accumulator version is 7 instructions. More instructions, but each one is explicit about
+  what it reads and writes. And there's no stack at all — just the accumulator and two registers.
+</p>
+
+<h2>Watch it run</h2>
+
+<div class="stepper" data-steps='[
+  {"label":"LdaSmi 30 — acc = 30","stack":[]},
+  {"label":"Star r0 — r0 = acc = 30","stack":[]},
+  {"label":"LdaSmi 20 — acc = 20","stack":[]},
+  {"label":"Star r1 — r1 = acc = 20","stack":[]},
+  {"label":"LdaSmi 40 — acc = 40","stack":[]},
+  {"label":"Mul r1 — acc = r1 * acc = 20 * 40 = 800","stack":[]},
+  {"label":"Add r0 — acc = r0 + acc = 30 + 800 = 830","stack":[]}
+]'>
+  <div class="stepper-controls">
+    <button data-prev>&larr; Prev</button>
+    <button data-next>Next &rarr;</button>
+    <span class="stepper-status">ready</span>
+  </div>
+  <div class="stepper-body">
+    <div class="stepper-instructions">
+      <div>LdaSmi 30</div>
+      <div>Star r0</div>
+      <div>LdaSmi 20</div>
+      <div>Star r1</div>
+      <div>LdaSmi 40</div>
+      <div>Mul r1</div>
+      <div>Add r0</div>
+    </div>
+    <div class="stepper-registers" style="min-width:140px; font-family:var(--font-mono); font-size:0.82rem;">
+      <div class="stepper-stack-label">Registers</div>
+      <div id="reg-display" style="line-height:1.8;"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+document.addEventListener('DOMContentLoaded', () => {
+  const regStates = [
+    {acc: 30, r0: '—', r1: '—'},
+    {acc: 30, r0: 30, r1: '—'},
+    {acc: 20, r0: 30, r1: '—'},
+    {acc: 20, r0: 30, r1: 20},
+    {acc: 40, r0: 30, r1: 20},
+    {acc: 800, r0: 30, r1: 20},
+    {acc: 830, r0: 30, r1: 20},
+  ];
+  const stepper = document.querySelector('.stepper');
+  const regDisplay = document.getElementById('reg-display');
+  const steps = JSON.parse(stepper.dataset.steps);
+  const instrLines = stepper.querySelectorAll('.stepper-instructions div');
+  const status = stepper.querySelector('.stepper-status');
+  const prevBtn = stepper.querySelector('[data-prev]');
+  const nextBtn = stepper.querySelector('[data-next]');
+  let current = -1;
+
+  function render() {
+    instrLines.forEach((line, i) => {
+      line.classList.remove('active', 'done');
+      if (i === current) line.classList.add('active');
+      else if (i < current) line.classList.add('done');
+    });
+    if (current >= 0 && current < regStates.length) {
+      const s = regStates[current];
+      regDisplay.innerHTML =
+        '<div><strong>acc</strong> = ' + s.acc + '</div>' +
+        '<div>r0 = ' + s.r0 + '</div>' +
+        '<div>r1 = ' + s.r1 + '</div>';
+    } else {
+      regDisplay.innerHTML =
+        '<div><strong>acc</strong> = —</div><div>r0 = —</div><div>r1 = —</div>';
+    }
+    status.textContent = current < 0 ? 'ready' : current < steps.length ? steps[current].label : 'done';
+    prevBtn.disabled = current < 0;
+    nextBtn.disabled = current >= steps.length - 1;
+  }
+
+  prevBtn.addEventListener('click', () => { if (current > -1) { current--; render(); } });
+  nextBtn.addEventListener('click', () => { if (current < steps.length - 1) { current++; render(); } });
+  render();
+});
+</script>
+
+<h2>The compilation algorithm</h2>
+
+<p>
+  The compiler still walks the AST in post-order. But now it needs a <strong>register counter</strong>
+  — a simple allocator that hands out the next free register each time a value needs to be stashed.
+</p>
+
+<p>The rule for each node type:</p>
+
+<ul>
+  <li>
+    <strong>Leaf (integer literal):</strong> emit <code>LdaSmi &lt;value&gt;</code>.
+    The value is now in the accumulator.
+  </li>
+  <li>
+    <strong>Binary op:</strong>
+    <ol>
+      <li>Compile the left child (result lands in accumulator)</li>
+      <li>Emit <code>Star rN</code> to stash the left result in a register</li>
+      <li>Compile the right child (result lands in accumulator)</li>
+      <li>Emit <code>Add rN</code> or <code>Mul rN</code> (operator uses the stashed left value)</li>
+    </ol>
+  </li>
+</ul>
+
+<pre><code>func (p *RegProgram) compile(node *AST) {
+    if node.Value != nil {
+        p.emit(OpLdaSmi, byte(*node.Value))
+        return
+    }
+
+    // Compile left → result in accumulator
+    p.compile(node.Left)
+
+    // Stash left result in a register
+    reg := p.allocReg()
+    p.emit(OpStar, reg)
+
+    // Compile right → result in accumulator
+    p.compile(node.Right)
+
+    // Binary op: reg ○ acc → acc
+    switch node.Op {
+    case OADD:
+        p.emit(OpRegAdd, reg)
+    case OMUL:
+        p.emit(OpRegMul, reg)
+    }
+}</code></pre>
+
+<div class="callout warn">
+  <strong>This allocator leaks registers.</strong> It hands them out but never reclaims them.
+  For your arithmetic expressions that's fine — the tree is small. A real compiler would
+  track register lifetimes and reuse freed registers. V8 does this; you don't need to yet.
+</div>
+
+<h2>The new VM</h2>
+
+<p>
+  The VM is almost the same loop, but instead of a stack it has an accumulator variable and
+  a register array:
+</p>
+
+<pre><code>type RegVM struct {
+    ip   int
+    acc  int
+    regs [256]int
+}
+
+func (vm *RegVM) FDE(program RegProgram) int {
+    for vm.ip &lt; len(program.Code) {
+        op := OpCode(program.Code[vm.ip])
+        vm.ip++
+
+        switch op {
+        case OpLdaSmi:
+            vm.acc = int(program.Code[vm.ip])
+            vm.ip++
+        case OpStar:
+            r := program.Code[vm.ip]
+            vm.ip++
+            vm.regs[r] = vm.acc
+        case OpLdar:
+            r := program.Code[vm.ip]
+            vm.ip++
+            vm.acc = vm.regs[r]
+        case OpRegAdd:
+            r := program.Code[vm.ip]
+            vm.ip++
+            vm.acc = vm.regs[r] + vm.acc
+        case OpRegMul:
+            r := program.Code[vm.ip]
+            vm.ip++
+            vm.acc = vm.regs[r] * vm.acc
+        }
+    }
+    return vm.acc
+}</code></pre>
+
+<p>
+  Notice: no Push, no Pop, no stack. The result is always in the accumulator when the
+  program finishes.
+</p>
+
+<h2>Check your understanding</h2>
+
+<div class="quiz" data-correct="1"
+     data-right="Correct. Compile left (LdaSmi 5), stash it (Star r0), compile right (LdaSmi 3), then Mul r0. Four instructions."
+     data-wrong="Follow the compilation rule: compile left → LdaSmi, stash with Star, compile right → LdaSmi, emit operator.">
+  <div class="quiz-question">
+    What accumulator bytecode does <code>5 * 3</code> compile to?
+  </div>
+  <div class="quiz-options">
+    <div class="quiz-option">LdaSmi 5, LdaSmi 3, Mul r0</div>
+    <div class="quiz-option">LdaSmi 5, Star r0, LdaSmi 3, Mul r0</div>
+    <div class="quiz-option">LdaSmi 3, Star r0, LdaSmi 5, Mul r0</div>
+    <div class="quiz-option">LdaSmi 5, Star r0, LdaSmi 3, Star r1, Mul r0</div>
+  </div>
+  <div class="quiz-feedback"></div>
+</div>
+
+<div class="quiz" data-correct="2"
+     data-right="Correct. The left subtree (2 * 3) needs two registers: r0 for the stash before Mul, and the result of Mul lands in acc. Then the outer + stashes that result in r1 before compiling the right side (4). Two registers total."
+     data-wrong="Trace the compiler through (2 * 3) + 4. Each binary op stashes its left operand. How many Star instructions get emitted?">
+  <div class="quiz-question">
+    How many registers does <code>(2 * 3) + 4</code> use?
+  </div>
+  <div class="quiz-options">
+    <div class="quiz-option">1</div>
+    <div class="quiz-option">3</div>
+    <div class="quiz-option">2</div>
+    <div class="quiz-option">4</div>
+  </div>
+  <div class="quiz-feedback"></div>
+</div>
+
+<h2>Now implement it</h2>
+
+<p>
+  You can build this alongside your existing stack machine — use different type names
+  (<code>RegProgram</code>, <code>RegVM</code>) or put it in a separate file.
+  The end-to-end test is the same: lex, parse, compile, run, assert <code>830</code>.
+</p>
+
+<p>
+  One thing to decide: <code>LdaSmi</code> in V8 embeds the integer directly in the bytecode
+  (no constant pool). For small integers that fit in a byte (0–255), this is simpler. For larger
+  values, you could keep a constant pool and use a <code>LdaConstant</code> instruction instead.
+  Start with the inline approach — it matches V8's design and eliminates the constant pool entirely
+  for your current grammar.
+</p>
+
+<h2>What's next</h2>
+
+<p>
+  With a register-based VM, you're now on the same architectural foundation as V8's Ignition.
+  The next steps toward a V8 isolate:
+</p>
+
+<ul>
+  <li><strong>Variables and let-bindings</strong> — registers become the natural home for local variables,
+    which is exactly what V8 does</li>
+  <li><strong>A disassembler</strong> — printing register-based bytecode is more useful than stack-based,
+    since you can see the data flow</li>
+  <li><strong>V8 embedding</strong> — using <code>v8go</code> or similar Go bindings to run code
+    inside an actual V8 isolate</li>
+</ul>
+
+<h2>Primary source</h2>
+
+<p>
+  Read V8's <a href="https://chromium.googlesource.com/v8/v8/+/refs/heads/main/src/interpreter/bytecodes.h">bytecodes.h</a>
+  — it's the authoritative list of every Ignition bytecode, with operand types and accumulator
+  usage annotated. Skim it to see how your three opcodes map to V8's real instruction set.
+  The <a href="https://v8.dev/blog/ignition-interpreter">Ignition blog post</a> explains the
+  design rationale.
+</p>
+
+<footer>
+  Questions about anything in this lesson? Ask your agent — that's what it's here for.
+  <br><br>
+  g8 teaching workspace &middot;
+  <a href="0001-ast-to-stack-bytecode.html">Lesson 1</a> &middot;
+  <a href="0002-building-the-vm.html">Lesson 2</a> &middot;
+  <a href="../reference/bytecode-instruction-set.html">Instruction Set Reference</a>
+</footer>
+
+<script src="../assets/quiz.js"></script>
+</body>
+</html>
