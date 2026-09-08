@@ -23,12 +23,15 @@ func TestProgram_Compile(t *testing.T) {
 				},
 			},
 			&Program{
-				code: []ByteCode{
-					OpPush,
-					OpPush,
-					OpPush,
-					OpAdd,
-					OpMul,
+				code: []byte{
+					byte(OpPush),
+					byte(0),
+					byte(OpPush),
+					byte(1),
+					byte(OpPush),
+					byte(2),
+					byte(OpAdd),
+					byte(OpMul),
 				},
 				cons: []int{1, 2, 3},
 			},

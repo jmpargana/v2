@@ -18,14 +18,15 @@ const (
 )
 
 type Program struct {
-	code []ByteCode
+	code []byte
 	cons []int
 }
 
 func (p *Program) Compile(ast *AST) *Program {
 	if ast.Value != nil {
+		idx := len(p.cons)
 		p.cons = append(p.cons, *ast.Value)
-		p.code = append(p.code, OpPush)
+		p.code = append(p.code, byte(OpPush), byte(idx))
 		return p
 	}
 	
@@ -34,9 +35,9 @@ func (p *Program) Compile(ast *AST) *Program {
 	
 	switch ast.Op {
 	case OMUL:
-		p.code = append(p.code, OpMul)
+		p.code = append(p.code, byte(OpMul))
 	case OADD:
-		p.code = append(p.code, OpAdd)
+		p.code = append(p.code, byte(OpAdd))
 	}
 	
 	return p
