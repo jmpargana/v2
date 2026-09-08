@@ -1,0 +1,422 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Lesson 6: Control Flow</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<h1>Control Flow</h1>
+<p class="lesson-meta">
+  Lesson 6 &middot; g8 bytecode compiler &middot;
+  Prev: <a href="0005-functions-and-call-frames.html">Functions and Call Frames</a> &middot;
+  Reference: <a href="../reference/bytecode-instruction-set.html">Instruction Set</a>
+</p>
+
+<p>
+  Until now, your VM has executed bytecode in a straight line — instruction 0, then 1, then 2.
+  The instruction pointer only ever moves forward. Control flow changes that. An <code>if</code>
+  statement means: <em>skip some instructions</em>. A loop means: <em>jump backward</em>.
+  The tool for both is a <strong>jump instruction</strong>.
+</p>
+
+<h2>Three new concepts</h2>
+
+<h3>1. Comparisons produce values</h3>
+
+<p>
+  Before you can branch, you need a condition. A comparison like <code>a &gt; b</code> needs to
+  produce a result that the VM can test. The simplest approach for g8: comparisons produce
+  integers — <code>1</code> for true, <code>0</code> for false. No boolean type needed.
+</p>
+
+<p>
+  Comparison opcodes follow the same accumulator convention as arithmetic: the left operand
+  is in a register, the right operand is in the accumulator, and the result (0 or 1) overwrites
+  the accumulator.
+</p>
+
+<table class="ref-table">
+  <thead><tr><th>Opcode</th><th>Operation</th><th>V8 equivalent</th></tr></thead>
+  <tbody>
+    <tr><td><code>OpTestEqual</code></td><td><code>acc = (reg == acc) ? 1 : 0</code></td><td><code>TestEqual</code></td></tr>
+    <tr><td><code>OpTestLessThan</code></td><td><code>acc = (reg &lt; acc) ? 1 : 0</code></td><td><code>TestLessThan</code></td></tr>
+    <tr><td><code>OpTestGreaterThan</code></td><td><code>acc = (reg &gt; acc) ? 1 : 0</code></td><td><code>TestGreaterThan</code></td></tr>
+  </tbody>
+</table>
+
+<p>
+  The compilation of <code>a &gt; b</code> is identical to <code>a + b</code> — compile left,
+  stash, compile right, emit operator. The only difference is which opcode.
+</p>
+
+<h3>2. Conditional jumps</h3>
+
+<p>
+  A <strong>jump</strong> changes the instruction pointer to a different position in the bytecode.
+  A <strong>conditional jump</strong> does so only if a condition is met.
+</p>
+
+<table class="ref-table">
+  <thead><tr><th>Opcode</th><th>Operand</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><code>OpJumpIfFalse</code></td>
+      <td>offset (1 byte)</td>
+      <td>If <code>acc == 0</code>, advance <code>ip</code> by <code>offset</code> bytes. Otherwise, continue.</td>
+    </tr>
+    <tr>
+      <td><code>OpJump</code></td>
+      <td>offset (1 byte)</td>
+      <td>Unconditionally advance <code>ip</code> by <code>offset</code> bytes.</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>
+  The offset is <strong>relative</strong> — it's added to the current <code>ip</code>, not an
+  absolute address. This means the jump is "skip forward N bytes," not "go to byte N."
+  V8 uses relative offsets too.
+</p>
+
+<div class="callout">
+  <strong>Why relative?</strong> If you insert or remove instructions before the jump, absolute
+  addresses break. Relative offsets are local — the jump only needs to know the distance to its
+  target, not where it sits in the overall program. This makes backpatching (below) simpler.
+</div>
+
+<h3>3. Backpatching</h3>
+
+<p>
+  Here's the problem: when the compiler emits <code>JumpIfFalse</code> at the start of an
+  <code>if</code> statement, it doesn't yet know how many bytes the then-branch will be. It can't
+  write the offset yet. The solution is <strong>backpatching</strong>:
+</p>
+
+<ol>
+  <li>Emit <code>JumpIfFalse</code> with a <strong>placeholder</strong> offset of 0</li>
+  <li>Remember the position of that placeholder</li>
+  <li>Compile the then-branch</li>
+  <li>Now you know how far ahead the else-branch starts</li>
+  <li>Go back and <strong>patch</strong> the placeholder with the real offset</li>
+</ol>
+
+<pre><code>// In the compiler:
+func (p *Program) emitJump(op ByteCode) int {
+    p.code = append(p.code, byte(op), 0) // placeholder
+    return len(p.code) - 1               // index of the placeholder byte
+}
+
+func (p *Program) patchJump(placeholder int) {
+    offset := len(p.code) - placeholder - 1
+    p.code[placeholder] = byte(offset)
+}</code></pre>
+
+<p>
+  <code>emitJump</code> writes the opcode and a 0 placeholder, then returns the index of that 0.
+  <code>patchJump</code> calculates the distance from the placeholder to the current end of code,
+  and overwrites the 0.
+</p>
+
+<h2>Compiling if/else</h2>
+
+<p>
+  The pattern for <code>if (cond) { then } else { alt }</code>:
+</p>
+
+<pre><code>compile(condition)         // acc = 0 or 1
+jumpIfFalse = emitJump(OpJumpIfFalse)
+                           // placeholder → skip to else
+compile(then-branch)
+jump = emitJump(OpJump)   // placeholder → skip over else
+patchJump(jumpIfFalse)    // now we know where else starts
+compile(else-branch)
+patchJump(jump)            // now we know where end is</code></pre>
+
+<p>
+  The two jumps work together: <code>JumpIfFalse</code> skips the then-branch if the condition
+  is false. <code>Jump</code> at the end of the then-branch skips the else-branch (so you don't
+  fall through into it).
+</p>
+
+<h2>Worked example</h2>
+
+<p>Source:</p>
+<pre><code>function max(a, b) {
+    if (a &gt; b) {
+        return a;
+    } else {
+        return b;
+    }
+}
+let result = max(5, 3);</code></pre>
+
+<h3>Bytecode for <code>max</code></h3>
+
+<pre><code>// params: a=r0, b=r1
+
+// Compile condition: a > b
+0000  Ldar   r0          // acc = a
+0002  Star   r2          // r2 = a (stash for >)
+0004  Ldar   r1          // acc = b
+0006  TestGT r2          // acc = (r2 > acc) = (a > b) ? 1 : 0
+
+// Conditional jump
+0008  JumpIfFalse 6      // if acc==0, skip 6 bytes → go to 0010
+
+// Then branch: return a
+000a  Ldar   r0          // acc = a
+000c  Return
+
+// Jump over else (not reached if we returned, but needed
+// if the then-branch didn't return)
+000e  Jump   4           // skip 4 bytes → go to 0014
+
+// Else branch: return b
+0010  Ldar   r1          // acc = b
+0012  Return</code></pre>
+
+<div class="callout warn">
+  <strong>Note on the Jump at 000e:</strong> In this example both branches <code>return</code>,
+  so the <code>Jump</code> is never reached. But the compiler doesn't analyze whether branches
+  return — it always emits the jump. Dead code elimination is an optimization pass, not the
+  compiler's job.
+</div>
+
+<h2>Watch it run</h2>
+
+<p>Executing <code>max(5, 3)</code> — condition is true (<code>5 &gt; 3</code>), so we take the then-branch:</p>
+
+<div class="stepper" data-steps='[
+  {"label":"Ldar r0 — acc = 5 (a)","stack":[]},
+  {"label":"Star r2 — r2 = 5","stack":[]},
+  {"label":"Ldar r1 — acc = 3 (b)","stack":[]},
+  {"label":"TestGT r2 — acc = (5 > 3) = 1","stack":[]},
+  {"label":"JumpIfFalse 6 — acc=1 (true), no jump","stack":[]},
+  {"label":"Ldar r0 — acc = 5 (a)","stack":[]},
+  {"label":"Return — pop frame, acc = 5","stack":[]}
+]'>
+  <div class="stepper-controls">
+    <button data-prev>&larr; Prev</button>
+    <button data-next>Next &rarr;</button>
+    <span class="stepper-status">ready</span>
+  </div>
+  <div class="stepper-body">
+    <div class="stepper-instructions">
+      <div><code style="color:var(--muted)">// a=5, b=3</code></div>
+      <div>Ldar r0</div>
+      <div>Star r2</div>
+      <div>Ldar r1</div>
+      <div>TestGT r2</div>
+      <div>JumpIfFalse 6</div>
+      <div><code style="color:var(--muted)">// then branch</code></div>
+      <div>Ldar r0</div>
+      <div>Return</div>
+      <div><code style="color:var(--muted)">// else branch (skipped)</code></div>
+      <div style="color:var(--muted)">Ldar r1</div>
+      <div style="color:var(--muted)">Return</div>
+    </div>
+    <div class="stepper-registers" style="min-width:140px; font-family:var(--font-mono); font-size:0.82rem;">
+      <div class="stepper-stack-label">Registers</div>
+      <div id="reg-display" style="line-height:1.8;"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+document.addEventListener('DOMContentLoaded', () => {
+  const states = [
+    {acc:5, r0:'5 (a)', r1:'3 (b)', r2:'—', ip:2},
+    {acc:5, r0:'5 (a)', r1:'3 (b)', r2:5, ip:4},
+    {acc:3, r0:'5 (a)', r1:'3 (b)', r2:5, ip:6},
+    {acc:1, r0:'5 (a)', r1:'3 (b)', r2:5, ip:8},
+    {acc:1, r0:'5 (a)', r1:'3 (b)', r2:5, ip:10},
+    {acc:5, r0:'5 (a)', r1:'3 (b)', r2:5, ip:12},
+    {acc:5, r0:'5 (a)', r1:'3 (b)', r2:5, ip:'—'},
+  ];
+  const stepper = document.querySelector('.stepper');
+  const regDisplay = document.getElementById('reg-display');
+  const steps = JSON.parse(stepper.dataset.steps);
+  const instrLines = stepper.querySelectorAll('.stepper-instructions div');
+  const commentIndices = [0,6,9];
+  const instrIndices = [1,2,3,4,5,7,8];
+  const status = stepper.querySelector('.stepper-status');
+  const prevBtn = stepper.querySelector('[data-prev]');
+  const nextBtn = stepper.querySelector('[data-next]');
+  let current = -1;
+
+  function render() {
+    instrIndices.forEach((lineIdx, stepIdx) => {
+      const line = instrLines[lineIdx];
+      line.classList.remove('active','done');
+      if (stepIdx === current) line.classList.add('active');
+      else if (stepIdx < current) line.classList.add('done');
+    });
+    if (current >= 0 && current < states.length) {
+      const s = states[current];
+      regDisplay.innerHTML =
+        '<div><strong>acc</strong> = ' + s.acc + '</div>' +
+        '<div><strong>ip</strong> = ' + s.ip + '</div>' +
+        '<div>r0 = ' + s.r0 + '</div>' +
+        '<div>r1 = ' + s.r1 + '</div>' +
+        '<div>r2 = ' + s.r2 + '</div>';
+    } else {
+      regDisplay.innerHTML =
+        '<div><strong>acc</strong> = —</div><div><strong>ip</strong> = —</div><div>r0 = 5 (a)</div><div>r1 = 3 (b)</div><div>r2 = —</div>';
+    }
+    status.textContent = current < 0 ? 'ready' : current < steps.length ? steps[current].label : 'done';
+    prevBtn.disabled = current < 0;
+    nextBtn.disabled = current >= steps.length - 1;
+  }
+
+  prevBtn.addEventListener('click', () => { if (current > -1) { current--; render(); } });
+  nextBtn.addEventListener('click', () => { if (current < steps.length - 1) { current++; render(); } });
+  render();
+});
+</script>
+
+<h2>The VM changes</h2>
+
+<p>The new handlers are short:</p>
+
+<pre><code>case OpTestEqual:
+    r := frame.bytecode.Code[frame.ip]; frame.ip++
+    if frame.regs[r] == vm.acc { vm.acc = 1 } else { vm.acc = 0 }
+
+case OpTestLessThan:
+    r := frame.bytecode.Code[frame.ip]; frame.ip++
+    if frame.regs[r] &lt; vm.acc { vm.acc = 1 } else { vm.acc = 0 }
+
+case OpTestGreaterThan:
+    r := frame.bytecode.Code[frame.ip]; frame.ip++
+    if frame.regs[r] &gt; vm.acc { vm.acc = 1 } else { vm.acc = 0 }
+
+case OpJumpIfFalse:
+    offset := frame.bytecode.Code[frame.ip]; frame.ip++
+    if vm.acc == 0 {
+        frame.ip += int(offset)
+    }
+
+case OpJump:
+    offset := frame.bytecode.Code[frame.ip]; frame.ip++
+    frame.ip += int(offset)</code></pre>
+
+<p>
+  Notice: the <code>ip</code> has already advanced past the opcode and the operand byte when
+  the jump executes. The offset is relative to <em>that</em> position — the byte after the
+  jump instruction. That's what <code>patchJump</code> computes.
+</p>
+
+<h2>The grammar extension</h2>
+
+<p>You need to add to your parser:</p>
+
+<pre><code>IfStmt := "if" "(" Expr ")" "{" Stmt* "}" ("else" "{" Stmt* "}")?</code></pre>
+
+<p>And three new comparison operators in expression parsing. The simplest approach:
+  add them at a new precedence level between <code>Expr</code> (additive) and <code>Term</code>
+  (multiplicative):
+</p>
+
+<pre><code>Expr     := Compare
+Compare  := Additive (("==" | "&lt;" | "&gt;") Additive)?
+Additive := Term ("+" Term)*
+Term     := Factor ("*" Factor)*</code></pre>
+
+<p>
+  Comparisons don't chain (<code>a &lt; b &lt; c</code> is not valid), so use <code>?</code>
+  not <code>*</code> — at most one comparison operator per expression.
+</p>
+
+<h2>Check your understanding</h2>
+
+<div class="quiz" data-correct="1"
+     data-right="Correct. The compiler emits JumpIfFalse with a placeholder 0, compiles the then-branch, then overwrites the placeholder with the actual distance to the else-branch."
+     data-wrong="Think about the order: the compiler encounters 'if', emits JumpIfFalse, but doesn't know how long the then-branch is yet. How does it fill in the jump target?">
+  <div class="quiz-question">
+    When compiling an <code>if</code> statement, why does the compiler emit <code>JumpIfFalse 0</code> initially?
+  </div>
+  <div class="quiz-options">
+    <div class="quiz-option">The jump offset is always 0</div>
+    <div class="quiz-option">It's a placeholder — patched after compiling the then-branch</div>
+    <div class="quiz-option">0 means "jump to the next instruction"</div>
+    <div class="quiz-option">The VM calculates the real offset at runtime</div>
+  </div>
+  <div class="quiz-feedback"></div>
+</div>
+
+<div class="quiz" data-correct="2"
+     data-right="Correct. Two jumps: JumpIfFalse skips the then-branch when condition is false, and Jump at the end of the then-branch skips the else-branch so you don't fall through."
+     data-wrong="Think about what happens if the condition is true: you execute the then-branch, and then? Without a jump, the VM would continue straight into the else-branch.">
+  <div class="quiz-question">
+    How many jump instructions does a complete <code>if/else</code> compile to?
+  </div>
+  <div class="quiz-options">
+    <div class="quiz-option">1 — JumpIfFalse only</div>
+    <div class="quiz-option">3 — JumpIfFalse, JumpIfTrue, Jump</div>
+    <div class="quiz-option">2 — JumpIfFalse and Jump</div>
+    <div class="quiz-option">2 — JumpIfFalse and JumpLoop</div>
+  </div>
+  <div class="quiz-feedback"></div>
+</div>
+
+<h2>Now implement it</h2>
+
+<ol>
+  <li><strong>Lexer:</strong> Add tokens for <code>==</code>, <code>&lt;</code>, <code>&gt;</code>,
+    <code>if</code>, <code>else</code>. Note: <code>=</code> is already <code>ASSIGN</code>, so
+    <code>==</code> needs lookahead (peek at the next character).</li>
+  <li><strong>AST:</strong> Add an <code>IfStmt</code> node (condition Expr, then []Stmt, else []Stmt).
+    Add comparison ops to your <code>Op</code> enum (or use a separate <code>CmpOp</code>).</li>
+  <li><strong>Parser:</strong> Add <code>parseIfStmt</code> and a comparison precedence level.</li>
+  <li><strong>Opcodes:</strong> Add <code>OpTestEqual</code>, <code>OpTestLessThan</code>,
+    <code>OpTestGreaterThan</code>, <code>OpJumpIfFalse</code>, <code>OpJump</code>.</li>
+  <li><strong>Compiler:</strong> Implement <code>emitJump</code> and <code>patchJump</code>.
+    Compile <code>IfStmt</code> using the two-jump pattern.</li>
+  <li><strong>VM:</strong> Add the five new opcode handlers.</li>
+  <li><strong>Test:</strong> <code>function max(a, b) { if (a &gt; b) { return a; } else { return b; } }</code>
+    — test with <code>max(5, 3)</code> → 5 and <code>max(2, 7)</code> → 7.</li>
+</ol>
+
+<h2>What's next</h2>
+
+<p>
+  With control flow, your language is expressive enough to write real programs. Combined with
+  functions and recursion, you can implement factorial, fibonacci, binary search.
+  The next frontiers:
+</p>
+
+<ul>
+  <li><strong>Loops</strong> — <code>while</code> uses the same jump machinery, but with a
+    backward <code>JumpLoop</code> instruction</li>
+  <li><strong>Recursion test</strong> — verify your call stack handles recursive calls correctly</li>
+  <li><strong>V8 embedding</strong> — you now understand every fundamental concept in Ignition.
+    Time to look at <code>v8go</code> and real isolates.</li>
+</ul>
+
+<h2>Primary source</h2>
+
+<p>
+  Read <a href="https://craftinginterpreters.com/jumping-back-and-forth.html">Crafting Interpreters, Ch. 23: Jumping Back and Forth</a>.
+  It covers if/else, while loops, for loops, and logical operators (and/or) — all built from
+  the same jump + backpatch mechanism. The backpatching technique is identical to what you'll
+  implement.
+</p>
+
+<footer>
+  Questions about anything in this lesson? Ask your agent — that's what it's here for.
+  <br><br>
+  g8 teaching workspace &middot;
+  <a href="0001-ast-to-stack-bytecode.html">Lesson 1</a> &middot;
+  <a href="0002-building-the-vm.html">Lesson 2</a> &middot;
+  <a href="0003-the-accumulator-model.html">Lesson 3</a> &middot;
+  <a href="0004-variables.html">Lesson 4</a> &middot;
+  <a href="0005-functions-and-call-frames.html">Lesson 5</a> &middot;
+  <a href="../reference/bytecode-instruction-set.html">Instruction Set Reference</a>
+</footer>
+
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

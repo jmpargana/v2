@@ -3,8 +3,8 @@ function add(a, b) {
 }
 
 function factorial(n) {
-  let a = 3;
+  let a = 3 * add(2, 3);
   return n * a;
 }
 
-factorial(2);
+factorial(10);

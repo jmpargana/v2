@@ -161,19 +161,22 @@ func (p *Program) Compile(stmts []Stmt) *Program {
 			p.symbols[stmt.Name] = reg
 			p.code = append(p.code, byte(OpStar), byte(reg))
 		case *FuncDecl:
+			idx := len(p.funcs)
+			p.funcs = append(p.funcs, nil)
+			p.funcMap[stmt.Name] = idx
+
 			program := Init()
 			program.paramCount = len(stmt.Params)
-			
+			program.funcMap = p.funcMap
+			program.funcs = p.funcs
+
 			for _, arg := range stmt.Params {
 				reg := program.allocReg()
 				program.symbols[arg] = reg
 			}
-			
+
 			program.Compile(stmt.Body)
-			// TODO: still unclear how to load params to program
-			idx := len(p.funcs)
-			p.funcs = append(p.funcs, program)
-			p.funcMap[stmt.Name] = idx
+			p.funcs[idx] = program
 
 		case *ReturnStmt:
 			p.CompileExpr(stmt.Value)
