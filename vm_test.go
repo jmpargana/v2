@@ -34,6 +34,53 @@ func TestVM_FDE(t *testing.T) {
 			},
 			830,
 		},
+		{
+			"with function call",
+			Program{
+				cons: []int{10, 20},
+				code: []byte{
+					byte(OpLdaSmi),
+					byte(0),
+					byte(OpStar),
+					byte(0),
+					byte(OpLdaSmi),
+					byte(1),
+					byte(OpStar),
+					byte(1),
+					byte(OpCall),
+					byte(0),
+				},
+				nextReg: 2,
+				symbols: map[string]int{},
+				paramCount: 0,
+				funcs: []*Program{
+					{
+						cons: []int{},
+						code: []byte{
+							byte(OpLdar),
+							byte(0),
+							byte(OpStar),
+							byte(2),
+							byte(OpLdar),
+							byte(1),
+							byte(OpAdd),
+							byte(2),
+							byte(OpReturn),
+						},
+						paramCount: 2,
+						nextReg: 3,
+						symbols: map[string]int{
+							"a": 0,
+							"b": 1,
+						},
+						funcs: []*Program{},
+						funcMap: map[string]int{},
+					},
+				},
+				funcMap: map[string]int{"add": 0},
+			},
+			30,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

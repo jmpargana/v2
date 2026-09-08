@@ -1,58 +1,83 @@
 package main
 
-import (
-	"fmt"
-	"strings"
-)
+import "fmt"
 
 type VM struct {
-	ip int // index to slice
 	acc int
+	stack []*Frame
+}
+
+func (vm *VM) String() string {
+	return fmt.Sprintf("VM{acc: %d, frames: %d}", vm.acc, len(vm.stack))
+}
+
+type Frame struct {
+	ip int
 	reg [256]int
+	program *Program
 }
 
 func Start() *VM {
 	return &VM{
-		ip: 0,
 		acc: 0,
-		reg: [256]int{},
+		stack: []*Frame{},
 	}
 }
 
-func (vm *VM) String() string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "IP:  %d\nACC: %d\n", vm.ip, vm.acc)
-	for i, v := range vm.reg {
-		if v != 0 {
-			fmt.Fprintf(&b, "r%-3d %d\n", i, v)
-		}
-	}
-	return b.String()
-}
-
-// Fetch, Decode, Execute
 func (vm *VM) FDE(program Program) int {
-	for vm.ip < len(program.code) {
-		opcode := ByteCode(program.code[vm.ip])			
-		vm.ip++
-		
+	vm.stack = append(vm.stack, &Frame{
+		program: &program,
+		reg:     [256]int{},
+		ip:      0,
+	})
+
+	for len(vm.stack) > 0 {
+		f := vm.stack[len(vm.stack)-1]
+		if f.ip >= len(f.program.code) {
+			vm.stack = vm.stack[:len(vm.stack)-1]
+			continue
+		}
+
+		opcode := ByteCode(f.program.code[f.ip])
+		f.ip++
+
 		switch opcode {
 		case OpLdaSmi:
-			vm.acc = int(program.cons[program.code[vm.ip]])
-			vm.ip++
+			vm.acc = f.program.cons[f.program.code[f.ip]]
+			f.ip++
 		case OpStar:
-			idx := int(program.code[vm.ip])
-			vm.ip++
-			vm.reg[idx] = vm.acc
+			idx := f.program.code[f.ip]
+			f.ip++
+			f.reg[idx] = vm.acc
+		case OpLdar:
+			idx := f.program.code[f.ip]
+			f.ip++
+			vm.acc = f.reg[idx]
 		case OpAdd:
-			idx := int(program.code[vm.ip])
-			vm.ip++
-			vm.acc += vm.reg[idx]
+			idx := f.program.code[f.ip]
+			f.ip++
+			vm.acc += f.reg[idx]
 		case OpMul:
-			idx := int(program.code[vm.ip])
-			vm.ip++
-			vm.acc *= vm.reg[idx]
+			idx := f.program.code[f.ip]
+			f.ip++
+			vm.acc *= f.reg[idx]
+		case OpCall:
+			funcIdx := f.program.code[f.ip]
+			f.ip++
+			function := f.program.funcs[funcIdx]
+			callFrame := &Frame{
+				program: function,
+				reg:     [256]int{},
+				ip:      0,
+			}
+			for i := range function.paramCount {
+				callFrame.reg[i] = f.reg[f.program.nextReg-function.paramCount+i]
+			}
+			vm.stack = append(vm.stack, callFrame)
+		case OpReturn:
+			vm.stack = vm.stack[:len(vm.stack)-1]
 		}
 	}
+
 	return vm.acc
 }
