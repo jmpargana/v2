@@ -32,23 +32,27 @@ func (vm *VM) String() string {
 
 // Fetch, Decode, Execute
 func (vm *VM) FDE(program Program) int {
-	return 0
-	// for vm.ip < len(program.code) {
-	// 	opcode := ByteCode(program.code[vm.ip])			
-	// 	vm.ip++
+	for vm.ip < len(program.code) {
+		opcode := ByteCode(program.code[vm.ip])			
+		vm.ip++
 		
-	// 	switch opcode {
-	// 	case OpPush:
-	// 		idx := int(program.code[vm.ip])
-	// 		vm.ip++
-	// 		vm.Push(program.cons[idx])
-	// 	case OpMul:
-	// 		b, a := vm.Pop(), vm.Pop()
-	// 		vm.Push(a * b)	
-	// 	case OpAdd:
-	// 		b, a := vm.Pop(), vm.Pop()
-	// 		vm.Push(a + b)	
-	// 	}
-	// }
-	// return vm.Pop()
+		switch opcode {
+		case OpLdaSmi:
+			vm.acc = int(program.cons[program.code[vm.ip]])
+			vm.ip++
+		case OpStar:
+			idx := int(program.code[vm.ip])
+			vm.ip++
+			vm.reg[idx] = vm.acc
+		case OpAdd:
+			idx := int(program.code[vm.ip])
+			vm.ip++
+			vm.acc += vm.reg[idx]
+		case OpMul:
+			idx := int(program.code[vm.ip])
+			vm.ip++
+			vm.acc *= vm.reg[idx]
+		}
+	}
+	return vm.acc
 }
