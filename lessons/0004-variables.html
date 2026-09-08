@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Lesson 4: Variables</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<h1>Variables</h1>
+<p class="lesson-meta">
+  Lesson 4 &middot; g8 bytecode compiler &middot;
+  Prev: <a href="0003-the-accumulator-model.html">The Accumulator Model</a> &middot;
+  Reference: <a href="../reference/bytecode-instruction-set.html">Instruction Set</a>
+</p>
+
+<p>
+  Until now your registers have been anonymous temporaries — the compiler allocates <code>r0</code>,
+  <code>r1</code>, uses them once, and forgets them. That changes with variables.
+  A variable is just a register with a name.
+</p>
+
+<h2>The new grammar</h2>
+
+<p>
+  Your language goes from a single expression to a <strong>program</strong> — a sequence of
+  <code>let</code> bindings followed by a final expression:
+</p>
+
+<pre><code>Program  := Stmt* Expr
+Stmt     := 'let' Ident '=' Expr
+Expr     := Res Op Res
+Res      := '(' Expr ')' | Ident | Digit
+Op       := '+' | '*'</code></pre>
+
+<p>A program looks like this:</p>
+
+<pre><code>let x = 10
+let y = 20 + x
+x * y</code></pre>
+
+<p>
+  Three new things: the <code>let</code> keyword, identifiers (<code>x</code>, <code>y</code>),
+  and the <code>=</code> sign. The final expression is the program's result.
+</p>
+
+<h2>What changes in each layer</h2>
+
+<h3>Lexer</h3>
+<p>Three new token kinds:</p>
+
+<table class="ref-table">
+  <thead><tr><th>Token</th><th>Example</th></tr></thead>
+  <tbody>
+    <tr><td><code>LET</code></td><td><code>let</code></td></tr>
+    <tr><td><code>IDENT</code></td><td><code>x</code>, <code>foo</code>, <code>myVar</code></td></tr>
+    <tr><td><code>ASSIGN</code></td><td><code>=</code></td></tr>
+  </tbody>
+</table>
+
+<p>
+  Identifiers are sequences of letters (and underscores, digits after the first character — your call
+  how strict). The lexer needs to distinguish <code>let</code> (keyword) from other identifiers.
+  Simplest approach: lex all letter-sequences as <code>IDENT</code>, then check if the string
+  is <code>"let"</code> and swap the kind.
+</p>
+
+<h3>AST</h3>
+<p>Two new node types:</p>
+
+<pre><code>// A let-binding: let x = &lt;expr&gt;
+type LetStmt struct {
+    Name  string
+    Value *AST
+}
+
+// A variable reference: x
+// Add a Name field to AST, or use a new node type</code></pre>
+
+<p>
+  The simplest change to your existing <code>AST</code> struct: add a <code>Name *string</code>
+  field. A leaf node is either an integer (<code>Value != nil</code>) or a variable reference
+  (<code>Name != nil</code>). And the program becomes a list of let-statements plus a final expression.
+</p>
+
+<h3>Parser</h3>
+<p>
+  The parser now handles a <strong>program</strong> (sequence of statements, then a final expression)
+  rather than a single expression. <code>parseRes</code> gains a new case: when it sees an
+  <code>IDENT</code> token, it returns a variable-reference AST node.
+</p>
+
+<h3>Compiler — the interesting part</h3>
+
+<p>
+  This is where variables meet registers. The compiler maintains a <strong>symbol table</strong>:
+  a map from variable name to register index.
+</p>
+
+<pre><code>type Compiler struct {
+    code    []byte
+    cons    []int
+    nextReg int
+    symbols map[string]int  // variable name → register index
+}</code></pre>
+
+<p>When the compiler sees <code>let x = 10 + 20</code>:</p>
+
+<ol>
+  <li>Compile the right-hand expression (<code>10 + 20</code>) — result lands in the accumulator</li>
+  <li>Allocate a register for <code>x</code></li>
+  <li>Emit <code>Star rN</code> — store the accumulator into <code>x</code>'s register</li>
+  <li>Record <code>symbols["x"] = N</code></li>
+</ol>
+
+<p>When the compiler later sees <code>x</code> used in an expression:</p>
+
+<ol>
+  <li>Look up <code>"x"</code> in the symbol table → register <code>rN</code></li>
+  <li>Emit <code>Ldar rN</code> — load the variable's value into the accumulator</li>
+</ol>
+
+<p>
+  <strong>This is where <code>Ldar</code> earns its place.</strong> It's the instruction that
+  reads a named variable. Every variable reference in source code becomes an <code>Ldar</code>
+  in bytecode.
+</p>
+
+<h2>Worked example</h2>
+
+<p>Source:</p>
+<pre><code>let x = 10
+let y = 20 + x
+x * y</code></pre>
+
+<p>Compilation trace:</p>
+
+<pre><code>// let x = 10
+LdaSmi [0]        // acc = constants[0] = 10
+Star   r0         // r0 = 10, symbols["x"] = r0
+
+// let y = 20 + x
+LdaSmi [1]        // acc = constants[1] = 20
+Star   r1         // r1 = 20 (temp stash for +)
+Ldar   r0         // acc = r0 = 10 (load x)
+Add    r1         // acc = r1 + acc = 20 + 10 = 30
+Star   r2         // r2 = 30, symbols["y"] = r2
+
+// x * y (final expression)
+Ldar   r0         // acc = r0 = 10 (load x)
+Star   r3         // r3 = 10 (temp stash for *)
+Ldar   r2         // acc = r2 = 30 (load y)
+Mul    r3         // acc = r3 * acc = 10 * 30 = 300
+
+Constants: [10, 20]</code></pre>
+
+<h2>Watch it run</h2>
+
+<div class="stepper" data-steps='[
+  {"label":"LdaSmi [0] — acc = 10","stack":[]},
+  {"label":"Star r0 — r0 = 10 (x is born)","stack":[]},
+  {"label":"LdaSmi [1] — acc = 20","stack":[]},
+  {"label":"Star r1 — r1 = 20 (temp for +)","stack":[]},
+  {"label":"Ldar r0 — acc = r0 = 10 (read x)","stack":[]},
+  {"label":"Add r1 — acc = 20 + 10 = 30","stack":[]},
+  {"label":"Star r2 — r2 = 30 (y is born)","stack":[]},
+  {"label":"Ldar r0 — acc = r0 = 10 (read x)","stack":[]},
+  {"label":"Star r3 — r3 = 10 (temp for *)","stack":[]},
+  {"label":"Ldar r2 — acc = r2 = 30 (read y)","stack":[]},
+  {"label":"Mul r3 — acc = 10 * 30 = 300","stack":[]}
+]'>
+  <div class="stepper-controls">
+    <button data-prev>&larr; Prev</button>
+    <button data-next>Next &rarr;</button>
+    <span class="stepper-status">ready</span>
+  </div>
+  <div class="stepper-body">
+    <div class="stepper-instructions">
+      <div><code style="color:var(--muted)">// let x = 10</code></div>
+      <div>LdaSmi [0]</div>
+      <div>Star r0</div>
+      <div><code style="color:var(--muted)">// let y = 20 + x</code></div>
+      <div>LdaSmi [1]</div>
+      <div>Star r1</div>
+      <div>Ldar r0</div>
+      <div>Add r1</div>
+      <div>Star r2</div>
+      <div><code style="color:var(--muted)">// x * y</code></div>
+      <div>Ldar r0</div>
+      <div>Star r3</div>
+      <div>Ldar r2</div>
+      <div>Mul r3</div>
+    </div>
+    <div class="stepper-registers" style="min-width:180px; font-family:var(--font-mono); font-size:0.82rem;">
+      <div class="stepper-stack-label">Registers</div>
+      <div id="reg-display" style="line-height:1.8;"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+document.addEventListener('DOMContentLoaded', () => {
+  const regStates = [
+    {acc: 10, r0: '—', r1: '—', r2: '—', r3: '—'},
+    {acc: 10, r0: '10 (x)', r1: '—', r2: '—', r3: '—'},
+    {acc: 20, r0: '10 (x)', r1: '—', r2: '—', r3: '—'},
+    {acc: 20, r0: '10 (x)', r1: 20, r2: '—', r3: '—'},
+    {acc: 10, r0: '10 (x)', r1: 20, r2: '—', r3: '—'},
+    {acc: 30, r0: '10 (x)', r1: 20, r2: '—', r3: '—'},
+    {acc: 30, r0: '10 (x)', r1: 20, r2: '30 (y)', r3: '—'},
+    {acc: 10, r0: '10 (x)', r1: 20, r2: '30 (y)', r3: '—'},
+    {acc: 10, r0: '10 (x)', r1: 20, r2: '30 (y)', r3: 10},
+    {acc: 30, r0: '10 (x)', r1: 20, r2: '30 (y)', r3: 10},
+    {acc: 300, r0: '10 (x)', r1: 20, r2: '30 (y)', r3: 10},
+  ];
+  const stepper = document.querySelector('.stepper');
+  const regDisplay = document.getElementById('reg-display');
+  const steps = JSON.parse(stepper.dataset.steps);
+  const instrLines = stepper.querySelectorAll('.stepper-instructions div');
+  const commentIndices = [0, 3, 9];
+  const instrIndices = [1,2,4,5,6,7,8,10,11,12];
+  const status = stepper.querySelector('.stepper-status');
+  const prevBtn = stepper.querySelector('[data-prev]');
+  const nextBtn = stepper.querySelector('[data-next]');
+  let current = -1;
+
+  function render() {
+    instrIndices.forEach((lineIdx, stepIdx) => {
+      const line = instrLines[lineIdx];
+      line.classList.remove('active', 'done');
+      if (stepIdx === current) line.classList.add('active');
+      else if (stepIdx < current) line.classList.add('done');
+    });
+    if (current >= 0 && current < regStates.length) {
+      const s = regStates[current];
+      regDisplay.innerHTML =
+        '<div><strong>acc</strong> = ' + s.acc + '</div>' +
+        '<div>r0 = ' + s.r0 + '</div>' +
+        '<div>r1 = ' + s.r1 + '</div>' +
+        '<div>r2 = ' + s.r2 + '</div>' +
+        '<div>r3 = ' + s.r3 + '</div>';
+    } else {
+      regDisplay.innerHTML =
+        '<div><strong>acc</strong> = —</div><div>r0 = —</div><div>r1 = —</div><div>r2 = —</div><div>r3 = —</div>';
+    }
+    status.textContent = current < 0 ? 'ready' : current < steps.length ? steps[current].label : 'done';
+    prevBtn.disabled = current < 0;
+    nextBtn.disabled = current >= steps.length - 1;
+  }
+
+  prevBtn.addEventListener('click', () => { if (current > -1) { current--; render(); } });
+  nextBtn.addEventListener('click', () => { if (current < steps.length - 1) { current++; render(); } });
+  render();
+});
+</script>
+
+<h2>Variables vs temporaries</h2>
+
+<p>
+  Look at the register file after execution. Some registers hold <strong>variables</strong> —
+  values that have names and might be read again. Others hold <strong>temporaries</strong> —
+  intermediate values the compiler stashed during a binary operation.
+</p>
+
+<table class="ref-table">
+  <thead><tr><th>Register</th><th>Contents</th><th>Role</th></tr></thead>
+  <tbody>
+    <tr><td><code>r0</code></td><td>10</td><td>Variable <code>x</code> — read twice later</td></tr>
+    <tr><td><code>r1</code></td><td>20</td><td>Temporary — stash for <code>+</code> in <code>20 + x</code></td></tr>
+    <tr><td><code>r2</code></td><td>30</td><td>Variable <code>y</code> — read once later</td></tr>
+    <tr><td><code>r3</code></td><td>10</td><td>Temporary — stash for <code>*</code> in <code>x * y</code></td></tr>
+  </tbody>
+</table>
+
+<p>
+  In V8, this distinction matters. Temporaries can be reused aggressively.
+  Variable registers must stay alive as long as the variable is in scope.
+  A real register allocator distinguishes the two; your linear allocator doesn't need to yet.
+</p>
+
+<h2>How V8 does it</h2>
+
+<p>
+  In V8, local variables <em>are</em> register slots. When Ignition compiles a function, it counts
+  the locals and allocates that many registers at the bottom of the register file. Temporaries
+  go above them. The frame layout looks like:
+</p>
+
+<pre><code>Register file for a function:
+  r0  → parameter 0 (or local 0)
+  r1  → parameter 1 (or local 1)
+  ...
+  rN  → last local
+  rN+1 → first temporary
+  rN+2 → second temporary
+  ...</code></pre>
+
+<p>
+  Variables that escape their scope (captured by closures, used across <code>eval</code>) go into
+  a <strong>context object</strong> on the heap instead — loaded with <code>LdaContextSlot</code>
+  and stored with <code>StaContextSlot</code>. But simple locals stay in registers, which is
+  the fast path.
+</p>
+
+<div class="callout">
+  <strong>Your VM is now doing the same thing V8 does for simple locals.</strong> A <code>let</code>
+  binding allocates a register. A variable reference emits <code>Ldar</code>. The symbol table
+  is your scope. This is the foundation that everything else builds on — functions, closures,
+  and control flow all rely on this mapping of names to registers.
+  <br><br>
+  <em>Source:</em> V8's <a href="https://chromium.googlesource.com/v8/v8/+/refs/heads/main/src/interpreter/bytecodes.h">bytecodes.h</a>
+</div>
+
+<h2>Check your understanding</h2>
+
+<div class="quiz" data-correct="1"
+     data-right="Correct. The let compiles the expression and Stars it into a register. Referencing a later uses Ldar to reload that register into the accumulator."
+     data-wrong="Think about what happens at each step: let a = expr compiles expr (acc = result), then Star rN. Using a later means loading rN back into acc.">
+  <div class="quiz-question">
+    After <code>let a = 5 + 3</code>, how does the compiler handle a later reference to <code>a</code> in an expression?
+  </div>
+  <div class="quiz-options">
+    <div class="quiz-option">Recompile the expression 5 + 3</div>
+    <div class="quiz-option">Emit Ldar with a's register index</div>
+    <div class="quiz-option">Emit LdaSmi with a's constant pool index</div>
+    <div class="quiz-option">Read a from the accumulator</div>
+  </div>
+  <div class="quiz-feedback"></div>
+</div>
+
+<div class="quiz" data-correct="2"
+     data-right="Correct. Two variable registers (a and b) + two temporaries (one stash per binary op in the final expression). The let-bindings each use one variable register; a + b stashes a in a temp, and then the outer * stashes the result in another temp."
+     data-wrong="Count: each let allocates one variable register. The final expression a * (a + b) has two binary ops, each stashing one temporary.">
+  <div class="quiz-question">
+    How many registers does this program use?<br>
+    <code>let a = 5</code><br>
+    <code>let b = 10</code><br>
+    <code>a * (a + b)</code>
+  </div>
+  <div class="quiz-options">
+    <div class="quiz-option">2 registers</div>
+    <div class="quiz-option">3 registers</div>
+    <div class="quiz-option">4 registers</div>
+    <div class="quiz-option">5 registers</div>
+  </div>
+  <div class="quiz-feedback"></div>
+</div>
+
+<h2>Now implement it</h2>
+
+<p>This is the biggest change to your codebase so far. Take it in order:</p>
+
+<ol>
+  <li><strong>Lexer:</strong> Add <code>LET</code>, <code>IDENT</code> (with a <code>Name string</code>
+    field on <code>Symbol</code>), and <code>ASSIGN</code> tokens. Handle the keyword check.</li>
+  <li><strong>AST:</strong> Add a <code>Name *string</code> field for variable references.
+    Add a <code>LetStmt</code> struct (or a separate AST node kind). Add a <code>ProgramAST</code>
+    that holds a list of lets plus a final expression.</li>
+  <li><strong>Parser:</strong> Add <code>parseProgram</code> (loops over let-statements, then parses
+    the final expression). Update <code>parseRes</code> to handle <code>IDENT</code> tokens.</li>
+  <li><strong>Compiler:</strong> Add a <code>symbols map[string]int</code>. For <code>let</code>,
+    compile the value, allocate a register, emit <code>Star</code>, record the mapping. For
+    variable references, look up the name, emit <code>Ldar</code>.</li>
+  <li><strong>VM:</strong> Add the <code>Ldar</code> handler (it's one line — you already have
+    the opcode defined).</li>
+</ol>
+
+<p>
+  Test the end-to-end pipeline with <code>let x = 10; let y = 20 + x; x * y</code> → 300.
+  Your disassembler will be especially useful here — print the bytecode and verify each
+  instruction makes sense.
+</p>
+
+<h2>What's next</h2>
+
+<p>
+  With variables, your language can express real computations. The next frontiers:
+</p>
+
+<ul>
+  <li><strong>Control flow</strong> — <code>if</code>/<code>else</code>, which introduces jump
+    instructions and the concept of basic blocks</li>
+  <li><strong>Functions</strong> — call frames, each with their own register file, and the
+    return instruction</li>
+  <li><strong>V8 embedding</strong> — hooking your compiled bytecode into a real V8 isolate</li>
+</ul>
+
+<h2>Primary source</h2>
+
+<p>
+  Read <a href="https://craftinginterpreters.com/global-variables.html">Crafting Interpreters, Ch. 21: Global Variables</a>
+  and <a href="https://craftinginterpreters.com/local-variables.html">Ch. 22: Local Variables</a>.
+  Ch. 21 uses a hash table for globals (like V8's <code>LdaGlobal</code>). Ch. 22 maps locals
+  directly to stack slots — the same idea as mapping them to registers, just in a stack-based VM.
+  Together they show both sides of the variable-storage design space.
+</p>
+
+<footer>
+  Questions about anything in this lesson? Ask your agent — that's what it's here for.
+  <br><br>
+  g8 teaching workspace &middot;
+  <a href="0001-ast-to-stack-bytecode.html">Lesson 1</a> &middot;
+  <a href="0002-building-the-vm.html">Lesson 2</a> &middot;
+  <a href="0003-the-accumulator-model.html">Lesson 3</a> &middot;
+  <a href="../reference/bytecode-instruction-set.html">Instruction Set Reference</a>
+</footer>
+
+<script src="../assets/quiz.js"></script>
+</body>
+</html>
