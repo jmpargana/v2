@@ -87,29 +87,9 @@ func (p *Program) alloReg() int {
 }
 
 
-func (p *Program) Compile(ast *AST) *Program {
-	if ast.Value != nil {
-		idx := len(p.cons)
-		p.cons = append(p.cons, *ast.Value)
-		p.code = append(p.code, byte(OpLdaSmi), byte(idx))
-		return p
-	}
-	
-	p.Compile(ast.Left)
-	
-	reg := p.alloReg()
-	p.code = append(p.code, byte(OpStar), byte(reg))
-	
-	p.Compile(ast.Right)
-	
-	switch ast.Op {
-	case OMUL:
-		p.code = append(p.code, byte(OpMul), byte(reg))
-	case OADD:
-		p.code = append(p.code, byte(OpAdd), byte(reg))
-	}
-	
-	return p
+func (p *Program) Compile(stmts []Stmt) *Program {
+	// TODO: implement bytecode compilation for new AST
+	panic("not implemented")
 }
 
 func (p *Program) Equals(other *Program) bool {
