@@ -132,13 +132,49 @@ impl Parser {
     }
 
     fn parse_expr(&mut self) -> Expr {
+        self.parse_logical_or()
+    }
+
+    fn parse_logical_or(&mut self) -> Expr {
+        let mut left = self.parse_logical_and();
+        while self.peek() == SymbolKind::Or {
+            self.pop();
+            let right = self.parse_logical_and();
+            left = Expr::Bool {
+                op: Op::Or,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
+        }
+        left
+    }
+
+    fn parse_logical_and(&mut self) -> Expr {
+        let mut left = self.parse_comparison();
+        while self.peek() == SymbolKind::And {
+            self.pop();
+            let right = self.parse_comparison();
+            left = Expr::Bool {
+                op: Op::And,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
+        }
+        left
+    }
+
+    fn parse_comparison(&mut self) -> Expr {
         let left = self.parse_additive();
         match self.peek() {
-            SymbolKind::Lt | SymbolKind::Gt | SymbolKind::Equal => {
+            SymbolKind::Lt | SymbolKind::Gt | SymbolKind::Equal
+            | SymbolKind::Lte | SymbolKind::Gte | SymbolKind::NotEqual => {
                 let op = match self.pop().kind {
                     SymbolKind::Lt => Op::Lt,
                     SymbolKind::Gt => Op::Gt,
                     SymbolKind::Equal => Op::Equal,
+                    SymbolKind::Lte => Op::Lte,
+                    SymbolKind::Gte => Op::Gte,
+                    SymbolKind::NotEqual => Op::NotEqual,
                     _ => unreachable!(),
                 };
                 let right = self.parse_additive();
@@ -206,6 +242,11 @@ impl Parser {
                 } else {
                     Expr::Ident(s.str_val)
                 }
+            }
+            SymbolKind::Not => {
+                self.pop();
+                let operand = self.parse_factor();
+                Expr::Not(Box::new(operand))
             }
             SymbolKind::LPar => {
                 self.pop();

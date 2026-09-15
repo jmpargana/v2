@@ -112,6 +112,34 @@ impl VM {
                     stack[fi].ip += 1;
                     self.acc = if self.acc < stack[fi].reg[idx] { 1 } else { 0 };
                 }
+                ByteCode::TestLessEqual => {
+                    let idx = stack[fi].program.code[stack[fi].ip] as usize;
+                    stack[fi].ip += 1;
+                    self.acc = if self.acc >= stack[fi].reg[idx] { 1 } else { 0 };
+                }
+                ByteCode::TestGreaterEqual => {
+                    let idx = stack[fi].program.code[stack[fi].ip] as usize;
+                    stack[fi].ip += 1;
+                    self.acc = if self.acc <= stack[fi].reg[idx] { 1 } else { 0 };
+                }
+                ByteCode::TestNotEqual => {
+                    let idx = stack[fi].program.code[stack[fi].ip] as usize;
+                    stack[fi].ip += 1;
+                    self.acc = if self.acc != stack[fi].reg[idx] { 1 } else { 0 };
+                }
+                ByteCode::LogicalAnd => {
+                    let idx = stack[fi].program.code[stack[fi].ip] as usize;
+                    stack[fi].ip += 1;
+                    self.acc = if self.acc != 0 && stack[fi].reg[idx] != 0 { 1 } else { 0 };
+                }
+                ByteCode::LogicalOr => {
+                    let idx = stack[fi].program.code[stack[fi].ip] as usize;
+                    stack[fi].ip += 1;
+                    self.acc = if self.acc != 0 || stack[fi].reg[idx] != 0 { 1 } else { 0 };
+                }
+                ByteCode::LogicalNot => {
+                    self.acc = if self.acc == 0 { 1 } else { 0 };
+                }
                 ByteCode::Jump => {
                     let offset = stack[fi].program.code[stack[fi].ip];
                     stack[fi].ip += offset as usize + 1;

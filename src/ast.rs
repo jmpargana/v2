@@ -9,7 +9,12 @@ pub enum Op {
     Div,
     Lt,
     Gt,
+    Lte,
+    Gte,
     Equal,
+    NotEqual,
+    And,
+    Or,
 }
 
 impl fmt::Display for Op {
@@ -21,7 +26,12 @@ impl fmt::Display for Op {
             Op::Div => write!(f, "/"),
             Op::Lt => write!(f, "<"),
             Op::Gt => write!(f, ">"),
+            Op::Lte => write!(f, "<="),
+            Op::Gte => write!(f, ">="),
             Op::Equal => write!(f, "=="),
+            Op::NotEqual => write!(f, "!="),
+            Op::And => write!(f, "&&"),
+            Op::Or => write!(f, "||"),
         }
     }
 }
@@ -44,6 +54,7 @@ pub enum Expr {
         func: String,
         args: Vec<Expr>,
     },
+    Not(Box<Expr>),
 }
 
 impl fmt::Display for Expr {
@@ -57,6 +68,7 @@ impl fmt::Display for Expr {
                 write!(f, "{}({})", func, args_str.join(", "))
             }
             Expr::Bool { op, left, right } => write!(f, "({} {} {})", left, op, right),
+            Expr::Not(operand) => write!(f, "(!{})", operand),
         }
     }
 }

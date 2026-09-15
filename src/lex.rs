@@ -24,6 +24,12 @@ pub enum SymbolKind {
     Lt,
     Gt,
     Equal,
+    NotEqual,
+    Lte,
+    Gte,
+    And,
+    Or,
+    Not,
     If,
     Else,
 }
@@ -53,6 +59,12 @@ impl fmt::Display for SymbolKind {
             SymbolKind::Lt => write!(f, "<"),
             SymbolKind::Gt => write!(f, ">"),
             SymbolKind::Equal => write!(f, "=="),
+            SymbolKind::NotEqual => write!(f, "!="),
+            SymbolKind::Lte => write!(f, "<="),
+            SymbolKind::Gte => write!(f, ">="),
+            SymbolKind::And => write!(f, "&&"),
+            SymbolKind::Or => write!(f, "||"),
+            SymbolKind::Not => write!(f, "!"),
             SymbolKind::If => write!(f, "IF"),
             SymbolKind::Else => write!(f, "ELSE"),
         }
@@ -116,20 +128,79 @@ impl Lexer {
                     i += 1;
                 }
                 '<' => {
-                    res.push(Symbol {
-                        kind: SymbolKind::Lt,
-                        int_val: None,
-                        str_val: String::new(),
-                    });
-                    i += 1;
+                    if i + 1 < chars.len() && chars[i + 1] == '=' {
+                        res.push(Symbol {
+                            kind: SymbolKind::Lte,
+                            int_val: None,
+                            str_val: String::new(),
+                        });
+                        i += 2;
+                    } else {
+                        res.push(Symbol {
+                            kind: SymbolKind::Lt,
+                            int_val: None,
+                            str_val: String::new(),
+                        });
+                        i += 1;
+                    }
                 }
                 '>' => {
-                    res.push(Symbol {
-                        kind: SymbolKind::Gt,
-                        int_val: None,
-                        str_val: String::new(),
-                    });
-                    i += 1;
+                    if i + 1 < chars.len() && chars[i + 1] == '=' {
+                        res.push(Symbol {
+                            kind: SymbolKind::Gte,
+                            int_val: None,
+                            str_val: String::new(),
+                        });
+                        i += 2;
+                    } else {
+                        res.push(Symbol {
+                            kind: SymbolKind::Gt,
+                            int_val: None,
+                            str_val: String::new(),
+                        });
+                        i += 1;
+                    }
+                }
+                '!' => {
+                    if i + 1 < chars.len() && chars[i + 1] == '=' {
+                        res.push(Symbol {
+                            kind: SymbolKind::NotEqual,
+                            int_val: None,
+                            str_val: String::new(),
+                        });
+                        i += 2;
+                    } else {
+                        res.push(Symbol {
+                            kind: SymbolKind::Not,
+                            int_val: None,
+                            str_val: String::new(),
+                        });
+                        i += 1;
+                    }
+                }
+                '&' => {
+                    if i + 1 < chars.len() && chars[i + 1] == '&' {
+                        res.push(Symbol {
+                            kind: SymbolKind::And,
+                            int_val: None,
+                            str_val: String::new(),
+                        });
+                        i += 2;
+                    } else {
+                        panic!("unexpected character: &");
+                    }
+                }
+                '|' => {
+                    if i + 1 < chars.len() && chars[i + 1] == '|' {
+                        res.push(Symbol {
+                            kind: SymbolKind::Or,
+                            int_val: None,
+                            str_val: String::new(),
+                        });
+                        i += 2;
+                    } else {
+                        panic!("unexpected character: |");
+                    }
                 }
                 '(' => {
                     res.push(Symbol {

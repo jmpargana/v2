@@ -20,6 +20,12 @@ pub enum ByteCode {
     TestGreater = 12,
     Jump = 13,
     JumpIfFalse = 14,
+    TestLessEqual = 15,
+    TestGreaterEqual = 16,
+    TestNotEqual = 17,
+    LogicalAnd = 18,
+    LogicalOr = 19,
+    LogicalNot = 20,
 }
 
 impl From<u8> for ByteCode {
@@ -40,6 +46,12 @@ impl From<u8> for ByteCode {
             12 => ByteCode::TestGreater,
             13 => ByteCode::Jump,
             14 => ByteCode::JumpIfFalse,
+            15 => ByteCode::TestLessEqual,
+            16 => ByteCode::TestGreaterEqual,
+            17 => ByteCode::TestNotEqual,
+            18 => ByteCode::LogicalAnd,
+            19 => ByteCode::LogicalOr,
+            20 => ByteCode::LogicalNot,
             _ => panic!("Unknown({})", val),
         }
     }
@@ -63,6 +75,12 @@ impl fmt::Display for ByteCode {
             ByteCode::TestGreater => write!(f, "TestGreater"),
             ByteCode::Jump => write!(f, "Jump"),
             ByteCode::JumpIfFalse => write!(f, "JumpIfFalse"),
+            ByteCode::TestLessEqual => write!(f, "TestLessEqual"),
+            ByteCode::TestGreaterEqual => write!(f, "TestGreaterEqual"),
+            ByteCode::TestNotEqual => write!(f, "TestNotEqual"),
+            ByteCode::LogicalAnd => write!(f, "LogicalAnd"),
+            ByteCode::LogicalOr => write!(f, "LogicalOr"),
+            ByteCode::LogicalNot => write!(f, "LogicalNot"),
         }
     }
 }
@@ -201,7 +219,7 @@ impl Program {
                         self.code.push(reg as u8);
                     }
                     _ => {
-                        panic!("ignoring bool logic for now");
+                        panic!("unexpected op in Binary expr: {}", op);
                     }
                 }
             }
@@ -215,6 +233,10 @@ impl Program {
                 self.code.push(ByteCode::Call as u8);
                 self.code.push(self.func_map[func] as u8);
             }
+            Expr::Not(operand) => {
+                self.compile_expr(operand);
+                self.code.push(ByteCode::LogicalNot as u8);
+            }
             Expr::Bool { op, left, right } => {
                 self.compile_expr(left);
                 let reg = self.alloc_reg();
@@ -224,8 +246,13 @@ impl Program {
                 let op_byte_code = match op {
                     Op::Lt => ByteCode::TestLess,
                     Op::Gt => ByteCode::TestGreater,
+                    Op::Lte => ByteCode::TestLessEqual,
+                    Op::Gte => ByteCode::TestGreaterEqual,
                     Op::Equal => ByteCode::TestEqual,
-                    _ => panic!("impossible"),
+                    Op::NotEqual => ByteCode::TestNotEqual,
+                    Op::And => ByteCode::LogicalAnd,
+                    Op::Or => ByteCode::LogicalOr,
+                    _ => panic!("unexpected op in Bool expr: {}", op),
                 } as u8;
                 self.code.push(op_byte_code);
                 self.code.push(reg as u8);
@@ -255,7 +282,7 @@ impl Program {
         while i < self.code.len() {
             let op = ByteCode::from(self.code[i]);
             match op {
-                ByteCode::Return => {
+                ByteCode::Return | ByteCode::LogicalNot => {
                     writeln!(b, "{}  {:04}  {}", indent, i, op).unwrap();
                     i += 1;
                 }
@@ -276,7 +303,10 @@ impl Program {
                                         .unwrap();
                                 }
                             }
-                            ByteCode::Star | ByteCode::Ldar | ByteCode::Add | ByteCode::Sub | ByteCode::Mul | ByteCode::Div => {
+                            ByteCode::Star | ByteCode::Ldar | ByteCode::Add | ByteCode::Sub | ByteCode::Mul | ByteCode::Div
+                            | ByteCode::TestEqual | ByteCode::TestLess | ByteCode::TestGreater
+                            | ByteCode::TestLessEqual | ByteCode::TestGreaterEqual | ByteCode::TestNotEqual
+                            | ByteCode::LogicalAnd | ByteCode::LogicalOr => {
                                 writeln!(b, "{}  {:04}  {:<8} r{}", indent, i, op, operand)
                                     .unwrap();
                             }
