@@ -1,7 +1,9 @@
-mod lex;
 mod ast;
-mod parser;
 mod bytecode;
+mod heap;
+mod lex;
+mod parser;
+mod value;
 mod vm;
 
 use std::env;
@@ -22,9 +24,10 @@ fn main() {
 
     let tokens = lex::Lexer::lex(&src);
     let stmts = parser::Parser::new(tokens).parse();
+    let mut heap = heap::Heap::new();
     let mut program = bytecode::Program::new();
-    program.compile(&stmts);
-    let result = vm::VM::new().fde(&program);
+    program.compile(&stmts, &mut heap);
+    let result = vm::VM::new(heap).fde(&program);
 
     println!("{}", result);
 }

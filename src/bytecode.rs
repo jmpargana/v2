@@ -1,4 +1,6 @@
 use crate::ast::{Expr, Op, Stmt};
+use crate::heap::Heap;
+use crate::value::Value;
 use std::collections::HashMap;
 use std::fmt::{self, Write};
 
@@ -88,7 +90,7 @@ impl fmt::Display for ByteCode {
 #[derive(Debug)]
 pub struct Program {
     pub code: Vec<u8>,
-    pub cons: Vec<i64>,
+    pub cons: Vec<Value>,
     pub funcs: Vec<Program>,
     pub func_map: HashMap<String, usize>,
     pub param_count: usize,
@@ -115,11 +117,11 @@ impl Program {
         val
     }
 
-    pub fn compile(&mut self, stmts: &[Stmt]) {
+    pub fn compile(&mut self, stmts: &[Stmt], heap: &mut Heap) {
         for stmt in stmts {
             match stmt {
                 Stmt::VarDecl { name, value, .. } => {
-                    self.compile_expr(value);
+                    self.compile_expr(value, heap);
                     let reg = self.alloc_reg();
                     self.symbols.insert(name.clone(), reg);
                     self.code.push(ByteCode::Star as u8);
@@ -139,29 +141,29 @@ impl Program {
                         child.symbols.insert(param.clone(), reg);
                     }
 
-                    child.compile(body);
+                    child.compile(body, heap);
                     self.funcs[idx] = child;
                 }
                 Stmt::Return(value) => {
-                    self.compile_expr(value);
+                    self.compile_expr(value, heap);
                     self.code.push(ByteCode::Return as u8);
                 }
                 Stmt::ExprStmt(expr) => {
-                    self.compile_expr(expr);
+                    self.compile_expr(expr, heap);
                 }
                 Stmt::Cond {
                     condition,
                     body,
                     alternate,
                 } => {
-                    self.compile_expr(condition);
+                    self.compile_expr(condition, heap);
                     let jump_false = self.emit_jump(ByteCode::JumpIfFalse);
-                    self.compile(body);
+                    self.compile(body, heap);
 
                     if alternate.is_some() {
                         let jump = self.emit_jump(ByteCode::Jump);
                         self.patch_jump(jump_false);
-                        self.compile(alternate.as_ref().unwrap());
+                        self.compile(alternate.as_ref().unwrap(), heap);
                         self.patch_jump(jump);
                     } else {
                         self.patch_jump(jump_false);
@@ -182,11 +184,17 @@ impl Program {
         self.code.len() - 1
     }
 
-    fn compile_expr(&mut self, expr: &Expr) {
+    fn compile_expr(&mut self, expr: &Expr, heap: &mut Heap) {
         match expr {
+            Expr::StringLit(val) => {
+                let idx = self.cons.len();
+                self.cons.push(heap.alloc_string(val));
+                self.code.push(ByteCode::LdaSmi as u8);
+                self.code.push(idx as u8);
+            }
             Expr::NumberLit(value) => {
                 let idx = self.cons.len();
-                self.cons.push(*value);
+                self.cons.push(Value::from_smi(*value));
                 self.code.push(ByteCode::LdaSmi as u8);
                 self.code.push(idx as u8);
             }
@@ -196,11 +204,11 @@ impl Program {
                 self.code.push(reg as u8);
             }
             Expr::Binary { op, left, right } => {
-                self.compile_expr(left);
+                self.compile_expr(left, heap);
                 let reg = self.alloc_reg();
                 self.code.push(ByteCode::Star as u8);
                 self.code.push(reg as u8);
-                self.compile_expr(right);
+                self.compile_expr(right, heap);
                 match op {
                     Op::Add => {
                         self.code.push(ByteCode::Add as u8);
@@ -225,24 +233,25 @@ impl Program {
             }
             Expr::Call { func, args } => {
                 for arg in args {
-                    self.compile_expr(arg);
+                    self.compile_expr(arg, heap);
                     let reg = self.alloc_reg();
                     self.code.push(ByteCode::Star as u8);
                     self.code.push(reg as u8);
                 }
                 self.code.push(ByteCode::Call as u8);
                 self.code.push(self.func_map[func] as u8);
+                self.code.push(self.next_reg as u8);
             }
             Expr::Not(operand) => {
-                self.compile_expr(operand);
+                self.compile_expr(operand, heap);
                 self.code.push(ByteCode::LogicalNot as u8);
             }
             Expr::Bool { op, left, right } => {
-                self.compile_expr(left);
+                self.compile_expr(left, heap);
                 let reg = self.alloc_reg();
                 self.code.push(ByteCode::Star as u8);
                 self.code.push(reg as u8);
-                self.compile_expr(right);
+                self.compile_expr(right, heap);
                 let op_byte_code = match op {
                     Op::Lt => ByteCode::TestLess,
                     Op::Gt => ByteCode::TestGreater,
@@ -294,7 +303,7 @@ impl Program {
                                 if operand < self.cons.len() {
                                     writeln!(
                                         b,
-                                        "{}  {:04}  {:<8} [{}] ({})",
+                                        "{}  {:04}  {:<8} [{}] ({:?})",
                                         indent, i, op, operand, self.cons[operand]
                                     )
                                     .unwrap();
@@ -303,14 +312,29 @@ impl Program {
                                         .unwrap();
                                 }
                             }
-                            ByteCode::Star | ByteCode::Ldar | ByteCode::Add | ByteCode::Sub | ByteCode::Mul | ByteCode::Div
-                            | ByteCode::TestEqual | ByteCode::TestLess | ByteCode::TestGreater
-                            | ByteCode::TestLessEqual | ByteCode::TestGreaterEqual | ByteCode::TestNotEqual
-                            | ByteCode::LogicalAnd | ByteCode::LogicalOr => {
+                            ByteCode::Star
+                            | ByteCode::Ldar
+                            | ByteCode::Add
+                            | ByteCode::Sub
+                            | ByteCode::Mul
+                            | ByteCode::Div
+                            | ByteCode::TestEqual
+                            | ByteCode::TestLess
+                            | ByteCode::TestGreater
+                            | ByteCode::TestLessEqual
+                            | ByteCode::TestGreaterEqual
+                            | ByteCode::TestNotEqual
+                            | ByteCode::LogicalAnd
+                            | ByteCode::LogicalOr => {
                                 writeln!(b, "{}  {:04}  {:<8} r{}", indent, i, op, operand)
                                     .unwrap();
                             }
                             ByteCode::Call => {
+                                let arg_end = if i + 2 < self.code.len() {
+                                    self.code[i + 2] as usize
+                                } else {
+                                    0
+                                };
                                 let name = self
                                     .func_map
                                     .iter()
@@ -319,14 +343,15 @@ impl Program {
                                 if let Some(name) = name {
                                     writeln!(
                                         b,
-                                        "{}  {:04}  {:<8} [{}] ({})",
-                                        indent, i, op, operand, name
+                                        "{}  {:04}  {:<8} [{}] ({}) args@r{}",
+                                        indent, i, op, operand, name, arg_end
                                     )
                                     .unwrap();
                                 } else {
-                                    writeln!(b, "{}  {:04}  {:<8} [{}]", indent, i, op, operand)
+                                    writeln!(b, "{}  {:04}  {:<8} [{}] args@r{}", indent, i, op, operand, arg_end)
                                         .unwrap();
                                 }
+                                i += 1;
                             }
                             _ => {
                                 writeln!(b, "{}  {:04}  {:<8} {}", indent, i, op, operand).unwrap();
@@ -369,6 +394,7 @@ impl fmt::Display for Program {
 mod tests {
     use super::*;
     use crate::ast::{Expr, Op, Stmt};
+    use crate::heap::Heap;
     use crate::lex::SymbolKind;
 
     #[test]
@@ -396,10 +422,11 @@ mod tests {
         ];
 
         let mut got = Program::new();
-        got.compile(&stmts);
+        let mut heap = Heap::new();
+        got.compile(&stmts, &mut heap);
 
         let mut want = Program::new();
-        want.cons = vec![10, 20];
+        want.cons = vec![Value::from_smi(10), Value::from_smi(20)];
         want.code = vec![
             ByteCode::LdaSmi as u8,
             0,
@@ -447,10 +474,11 @@ mod tests {
         ];
 
         let mut got = Program::new();
-        got.compile(&stmts);
+        let mut heap = Heap::new();
+        got.compile(&stmts, &mut heap);
 
         let mut want = Program::new();
-        want.cons = vec![10, 20];
+        want.cons = vec![Value::from_smi(10), Value::from_smi(20)];
         want.code = vec![
             ByteCode::LdaSmi as u8,
             0,
@@ -462,8 +490,104 @@ mod tests {
             1,
             ByteCode::Call as u8,
             0,
+            2,
         ];
 
         assert!(got.equals(&want), "got:\n{}\nwant:\n{}", got, want);
+    }
+
+    #[test]
+    fn string_var_decl() {
+        let stmts = vec![Stmt::VarDecl {
+            kind: SymbolKind::Let,
+            name: "s".to_string(),
+            value: Expr::StringLit("hello".to_string()),
+        }];
+
+        let mut got = Program::new();
+        let mut heap = Heap::new();
+        got.compile(&stmts, &mut heap);
+
+        assert_eq!(got.code, vec![ByteCode::LdaSmi as u8, 0, ByteCode::Star as u8, 0]);
+        assert!(got.cons[0].is_smi() == false);
+        assert_eq!(heap.read_string(got.cons[0]), "hello");
+    }
+
+    #[test]
+    fn string_equality_bytecode() {
+        let stmts = vec![Stmt::ExprStmt(Expr::Bool {
+            op: Op::Equal,
+            left: Box::new(Expr::StringLit("a".to_string())),
+            right: Box::new(Expr::StringLit("b".to_string())),
+        })];
+
+        let mut got = Program::new();
+        let mut heap = Heap::new();
+        got.compile(&stmts, &mut heap);
+
+        assert_eq!(
+            got.code,
+            vec![
+                ByteCode::LdaSmi as u8, 0,
+                ByteCode::Star as u8, 0,
+                ByteCode::LdaSmi as u8, 1,
+                ByteCode::TestEqual as u8, 0,
+            ]
+        );
+        assert_eq!(heap.read_string(got.cons[0]), "a");
+        assert_eq!(heap.read_string(got.cons[1]), "b");
+    }
+
+    #[test]
+    fn conditional_bytecode() {
+        // if (x > 0) { let y = 1; }
+        let stmts = vec![Stmt::Cond {
+            condition: Expr::Bool {
+                op: Op::Gt,
+                left: Box::new(Expr::Ident("x".to_string())),
+                right: Box::new(Expr::NumberLit(0)),
+            },
+            body: vec![Stmt::VarDecl {
+                kind: SymbolKind::Let,
+                name: "y".to_string(),
+                value: Expr::NumberLit(1),
+            }],
+            alternate: None,
+        }];
+
+        let mut got = Program::new();
+        got.symbols.insert("x".to_string(), 0);
+        got.next_reg = 1;
+        let mut heap = Heap::new();
+        got.compile(&stmts, &mut heap);
+
+        assert_eq!(
+            got.code,
+            vec![
+                ByteCode::Ldar as u8, 0,
+                ByteCode::Star as u8, 1,
+                ByteCode::LdaSmi as u8, 0,
+                ByteCode::TestGreater as u8, 1,
+                ByteCode::JumpIfFalse as u8, 4,
+                ByteCode::LdaSmi as u8, 1,
+                ByteCode::Star as u8, 2,
+            ]
+        );
+    }
+
+    #[test]
+    fn logical_not_bytecode() {
+        let stmts = vec![Stmt::ExprStmt(Expr::Not(Box::new(Expr::Ident("x".to_string()))))];
+
+        let mut got = Program::new();
+        got.symbols.insert("x".to_string(), 0);
+        got.next_reg = 1;
+        let mut heap = Heap::new();
+        got.compile(&stmts, &mut heap);
+
+        assert_eq!(
+            got.code,
+            vec![ByteCode::Ldar as u8, 0, ByteCode::LogicalNot as u8]
+        );
     }
 }

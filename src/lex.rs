@@ -32,6 +32,7 @@ pub enum SymbolKind {
     Not,
     If,
     Else,
+    Str,
 }
 
 impl fmt::Display for SymbolKind {
@@ -67,6 +68,7 @@ impl fmt::Display for SymbolKind {
             SymbolKind::Not => write!(f, "!"),
             SymbolKind::If => write!(f, "IF"),
             SymbolKind::Else => write!(f, "ELSE"),
+            SymbolKind::Str => write!(f, "STRING"),
         }
     }
 }
@@ -267,6 +269,20 @@ impl Lexer {
                     });
                     i += 1;
                 }
+                '"' => {
+                    i += 1;
+                    let start = i;
+                    while i < chars.len() && chars[i] != '"' {
+                        i += 1;
+                    }
+                    let str: String = chars[start..i].iter().collect::<String>();
+                    i += 1;
+                    res.push(Symbol {
+                        kind: SymbolKind::Str,
+                        int_val: None,
+                        str_val: str,
+                    });
+                }
                 _ if ch.is_ascii_digit() => {
                     let start = i;
                     while i < chars.len() && chars[i].is_ascii_digit() {
@@ -449,6 +465,46 @@ mod tests {
                 tok(SymbolKind::Semi),
             ]
         );
+    }
+
+    fn str_lit(val: &str) -> Symbol {
+        Symbol {
+            kind: SymbolKind::Str,
+            int_val: None,
+            str_val: val.to_string(),
+        }
+    }
+
+    #[test]
+    fn string_literal() {
+        assert_eq!(Lexer::lex("\"hello\""), vec![str_lit("hello")]);
+    }
+
+    #[test]
+    fn string_literal_with_spaces() {
+        assert_eq!(
+            Lexer::lex("\"hello world\""),
+            vec![str_lit("hello world")]
+        );
+    }
+
+    #[test]
+    fn string_in_var_decl() {
+        assert_eq!(
+            Lexer::lex("let x = \"foo\";"),
+            vec![
+                tok(SymbolKind::Let),
+                ident("x"),
+                tok(SymbolKind::Assign),
+                str_lit("foo"),
+                tok(SymbolKind::Semi),
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_string() {
+        assert_eq!(Lexer::lex("\"\""), vec![str_lit("")]);
     }
 
     #[test]

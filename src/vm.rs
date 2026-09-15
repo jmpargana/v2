@@ -1,14 +1,19 @@
-use crate::bytecode::{ByteCode, Program};
+use crate::{
+    bytecode::{ByteCode, Program},
+    heap::Heap,
+    value::Value,
+};
 use std::fmt;
 
 struct Frame<'a> {
     ip: usize,
-    reg: [i64; 256],
+    reg: [Value; 256],
     program: &'a Program,
 }
 
 pub struct VM {
-    acc: i64,
+    acc: Value,
+    heap: Heap,
 }
 
 impl fmt::Display for VM {
@@ -18,14 +23,17 @@ impl fmt::Display for VM {
 }
 
 impl VM {
-    pub fn new() -> Self {
-        VM { acc: 0 }
+    pub fn new(heap: Heap) -> Self {
+        VM {
+            acc: Default::default(),
+            heap,
+        }
     }
 
     pub fn fde(&mut self, program: &Program) -> i64 {
         let mut stack: Vec<Frame> = vec![Frame {
             ip: 0,
-            reg: [0; 256],
+            reg: [Default::default(); 256],
             program,
         }];
 
@@ -58,32 +66,33 @@ impl VM {
                 ByteCode::Add => {
                     let idx = stack[fi].program.code[stack[fi].ip] as usize;
                     stack[fi].ip += 1;
-                    self.acc += stack[fi].reg[idx];
+                    self.acc = Value::from_smi(self.acc.as_smi() + stack[fi].reg[idx].as_smi())
                 }
                 ByteCode::Sub => {
                     let idx = stack[fi].program.code[stack[fi].ip] as usize;
                     stack[fi].ip += 1;
-                    self.acc = stack[fi].reg[idx] - self.acc;
+                    self.acc = Value::from_smi(stack[fi].reg[idx].as_smi() - self.acc.as_smi())
                 }
                 ByteCode::Mul => {
                     let idx = stack[fi].program.code[stack[fi].ip] as usize;
                     stack[fi].ip += 1;
-                    self.acc *= stack[fi].reg[idx];
+                    self.acc = Value::from_smi(self.acc.as_smi() * stack[fi].reg[idx].as_smi())
                 }
                 ByteCode::Div => {
                     let idx = stack[fi].program.code[stack[fi].ip] as usize;
                     stack[fi].ip += 1;
-                    self.acc = stack[fi].reg[idx] / self.acc;
+                    self.acc = Value::from_smi(stack[fi].reg[idx].as_smi() / self.acc.as_smi())
                 }
                 ByteCode::Call => {
                     let func_idx = stack[fi].program.code[stack[fi].ip] as usize;
                     stack[fi].ip += 1;
+                    let arg_end = stack[fi].program.code[stack[fi].ip] as usize;
+                    stack[fi].ip += 1;
                     let function = &program.funcs[func_idx];
-                    let next_reg = stack[fi].program.next_reg;
                     let param_count = function.param_count;
-                    let mut regs = [0i64; 256];
+                    let mut regs = [Value::default(); 256];
                     for i in 0..param_count {
-                        regs[i] = stack[fi].reg[next_reg - param_count + i];
+                        regs[i] = stack[fi].reg[arg_end - param_count + i];
                     }
                     stack.push(Frame {
                         ip: 0,
@@ -100,45 +109,93 @@ impl VM {
                 ByteCode::TestEqual => {
                     let idx = stack[fi].program.code[stack[fi].ip] as usize;
                     stack[fi].ip += 1;
-                    self.acc = if self.acc == stack[fi].reg[idx] { 1 } else { 0 };
+                    if self.acc.is_smi() {
+                        self.acc = if self.acc.as_smi() == stack[fi].reg[idx].as_smi() {
+                            Value::from_smi(1)
+                        } else {
+                            Value::from_smi(0)
+                        };
+                    } else {
+                        let a = self.heap.read_string(self.acc);
+                        let b = self.heap.read_string(stack[fi].reg[idx]);
+                        self.acc = if a == b {
+                            Value::from_smi(1)
+                        } else {
+                            Value::from_smi(0)
+                        };
+                    }
                 }
                 ByteCode::TestLess => {
                     let idx = stack[fi].program.code[stack[fi].ip] as usize;
                     stack[fi].ip += 1;
-                    self.acc = if self.acc > stack[fi].reg[idx] { 1 } else { 0 };
+                    self.acc = if self.acc.as_smi() > stack[fi].reg[idx].as_smi() {
+                        Value::from_smi(1)
+                    } else {
+                        Value::from_smi(0)
+                    };
                 }
                 ByteCode::TestGreater => {
                     let idx = stack[fi].program.code[stack[fi].ip] as usize;
                     stack[fi].ip += 1;
-                    self.acc = if self.acc < stack[fi].reg[idx] { 1 } else { 0 };
+                    self.acc = if self.acc.as_smi() < stack[fi].reg[idx].as_smi() {
+                        Value::from_smi(1)
+                    } else {
+                        Value::from_smi(0)
+                    };
                 }
                 ByteCode::TestLessEqual => {
                     let idx = stack[fi].program.code[stack[fi].ip] as usize;
                     stack[fi].ip += 1;
-                    self.acc = if self.acc >= stack[fi].reg[idx] { 1 } else { 0 };
+                    self.acc = if self.acc.as_smi() >= stack[fi].reg[idx].as_smi() {
+                        Value::from_smi(1)
+                    } else {
+                        Value::from_smi(0)
+                    };
                 }
                 ByteCode::TestGreaterEqual => {
                     let idx = stack[fi].program.code[stack[fi].ip] as usize;
                     stack[fi].ip += 1;
-                    self.acc = if self.acc <= stack[fi].reg[idx] { 1 } else { 0 };
+                    self.acc = if self.acc.as_smi() <= stack[fi].reg[idx].as_smi() {
+                        Value::from_smi(1)
+                    } else {
+                        Value::from_smi(0)
+                    };
                 }
                 ByteCode::TestNotEqual => {
                     let idx = stack[fi].program.code[stack[fi].ip] as usize;
                     stack[fi].ip += 1;
-                    self.acc = if self.acc != stack[fi].reg[idx] { 1 } else { 0 };
+                    self.acc = if self.acc != stack[fi].reg[idx] {
+                        Value::from_smi(1)
+                    } else {
+                        Value::from_smi(0)
+                    };
                 }
                 ByteCode::LogicalAnd => {
                     let idx = stack[fi].program.code[stack[fi].ip] as usize;
                     stack[fi].ip += 1;
-                    self.acc = if self.acc != 0 && stack[fi].reg[idx] != 0 { 1 } else { 0 };
+                    let zero = Value::from_smi(0);
+                    self.acc = if self.acc != zero && stack[fi].reg[idx] != zero {
+                        Value::from_smi(1)
+                    } else {
+                        Value::from_smi(0)
+                    };
                 }
                 ByteCode::LogicalOr => {
                     let idx = stack[fi].program.code[stack[fi].ip] as usize;
                     stack[fi].ip += 1;
-                    self.acc = if self.acc != 0 || stack[fi].reg[idx] != 0 { 1 } else { 0 };
+                    let zero = Value::from_smi(0);
+                    self.acc = if self.acc != zero || stack[fi].reg[idx] != zero {
+                        Value::from_smi(1)
+                    } else {
+                        Value::from_smi(0)
+                    };
                 }
                 ByteCode::LogicalNot => {
-                    self.acc = if self.acc == 0 { 1 } else { 0 };
+                    self.acc = if self.acc == Value::from_smi(0) {
+                        Value::from_smi(1)
+                    } else {
+                        Value::from_smi(0)
+                    };
                 }
                 ByteCode::Jump => {
                     let offset = stack[fi].program.code[stack[fi].ip];
@@ -147,14 +204,14 @@ impl VM {
                 ByteCode::JumpIfFalse => {
                     let offset = stack[fi].program.code[stack[fi].ip];
                     stack[fi].ip += 1;
-                    if self.acc == 0 {
+                    if self.acc == Value::from_smi(0) {
                         stack[fi].ip += offset as usize;
                     }
                 }
             }
         }
 
-        self.acc
+        self.acc.as_smi()
     }
 }
 
@@ -183,7 +240,7 @@ mod tests {
                 ByteCode::Add as u8,
                 0,
             ],
-            cons: vec![30, 20, 40],
+            cons: vec![Value::from_smi(30), Value::from_smi(20), Value::from_smi(40)],
             funcs: vec![],
             func_map: HashMap::new(),
             param_count: 0,
@@ -191,7 +248,7 @@ mod tests {
             symbols: HashMap::new(),
         };
 
-        let mut vm = VM::new();
+        let mut vm = VM::new(Heap::new());
         assert_eq!(vm.fde(&program), 830);
     }
 
@@ -209,8 +266,9 @@ mod tests {
                 1,
                 ByteCode::Call as u8,
                 0,
+                2,
             ],
-            cons: vec![10, 20],
+            cons: vec![Value::from_smi(10), Value::from_smi(20)],
             funcs: vec![Program {
                 code: vec![
                     ByteCode::Ldar as u8,
@@ -236,7 +294,273 @@ mod tests {
             symbols: HashMap::new(),
         };
 
-        let mut vm = VM::new();
+        let mut vm = VM::new(Heap::new());
         assert_eq!(vm.fde(&program), 30);
+    }
+
+    #[test]
+    fn test_equal_true() {
+        let program = Program {
+            code: vec![
+                ByteCode::LdaSmi as u8, 0,
+                ByteCode::Star as u8, 0,
+                ByteCode::LdaSmi as u8, 0,
+                ByteCode::TestEqual as u8, 0,
+            ],
+            cons: vec![Value::from_smi(42)],
+            funcs: vec![],
+            func_map: HashMap::new(),
+            param_count: 0,
+            next_reg: 0,
+            symbols: HashMap::new(),
+        };
+        let mut vm = VM::new(Heap::new());
+        assert_eq!(vm.fde(&program), 1);
+    }
+
+    #[test]
+    fn test_equal_false() {
+        let program = Program {
+            code: vec![
+                ByteCode::LdaSmi as u8, 0,
+                ByteCode::Star as u8, 0,
+                ByteCode::LdaSmi as u8, 1,
+                ByteCode::TestEqual as u8, 0,
+            ],
+            cons: vec![Value::from_smi(1), Value::from_smi(2)],
+            funcs: vec![],
+            func_map: HashMap::new(),
+            param_count: 0,
+            next_reg: 0,
+            symbols: HashMap::new(),
+        };
+        let mut vm = VM::new(Heap::new());
+        assert_eq!(vm.fde(&program), 0);
+    }
+
+    #[test]
+    fn test_less_than() {
+        // reg[0] = 5, acc = 10 → acc > reg[0] → TestLess yields 1
+        let program = Program {
+            code: vec![
+                ByteCode::LdaSmi as u8, 0,
+                ByteCode::Star as u8, 0,
+                ByteCode::LdaSmi as u8, 1,
+                ByteCode::TestLess as u8, 0,
+            ],
+            cons: vec![Value::from_smi(5), Value::from_smi(10)],
+            funcs: vec![],
+            func_map: HashMap::new(),
+            param_count: 0,
+            next_reg: 0,
+            symbols: HashMap::new(),
+        };
+        let mut vm = VM::new(Heap::new());
+        assert_eq!(vm.fde(&program), 1);
+    }
+
+    #[test]
+    fn test_greater_than() {
+        // reg[0] = 10, acc = 5 → acc < reg[0] → TestGreater yields 1
+        let program = Program {
+            code: vec![
+                ByteCode::LdaSmi as u8, 0,
+                ByteCode::Star as u8, 0,
+                ByteCode::LdaSmi as u8, 1,
+                ByteCode::TestGreater as u8, 0,
+            ],
+            cons: vec![Value::from_smi(10), Value::from_smi(5)],
+            funcs: vec![],
+            func_map: HashMap::new(),
+            param_count: 0,
+            next_reg: 0,
+            symbols: HashMap::new(),
+        };
+        let mut vm = VM::new(Heap::new());
+        assert_eq!(vm.fde(&program), 1);
+    }
+
+    #[test]
+    fn test_logical_not() {
+        let program = Program {
+            code: vec![
+                ByteCode::LdaSmi as u8, 0,
+                ByteCode::LogicalNot as u8,
+            ],
+            cons: vec![Value::from_smi(0)],
+            funcs: vec![],
+            func_map: HashMap::new(),
+            param_count: 0,
+            next_reg: 0,
+            symbols: HashMap::new(),
+        };
+        let mut vm = VM::new(Heap::new());
+        assert_eq!(vm.fde(&program), 1);
+    }
+
+    #[test]
+    fn test_logical_and() {
+        let program = Program {
+            code: vec![
+                ByteCode::LdaSmi as u8, 0,
+                ByteCode::Star as u8, 0,
+                ByteCode::LdaSmi as u8, 0,
+                ByteCode::LogicalAnd as u8, 0,
+            ],
+            cons: vec![Value::from_smi(1)],
+            funcs: vec![],
+            func_map: HashMap::new(),
+            param_count: 0,
+            next_reg: 0,
+            symbols: HashMap::new(),
+        };
+        let mut vm = VM::new(Heap::new());
+        assert_eq!(vm.fde(&program), 1);
+    }
+
+    #[test]
+    fn test_logical_or() {
+        let program = Program {
+            code: vec![
+                ByteCode::LdaSmi as u8, 0,
+                ByteCode::Star as u8, 0,
+                ByteCode::LdaSmi as u8, 1,
+                ByteCode::LogicalOr as u8, 0,
+            ],
+            cons: vec![Value::from_smi(1), Value::from_smi(0)],
+            funcs: vec![],
+            func_map: HashMap::new(),
+            param_count: 0,
+            next_reg: 0,
+            symbols: HashMap::new(),
+        };
+        let mut vm = VM::new(Heap::new());
+        assert_eq!(vm.fde(&program), 1);
+    }
+
+    #[test]
+    fn test_jump_if_false() {
+        // acc = 0 → JumpIfFalse skips over LdaSmi(99) → acc stays 0
+        let program = Program {
+            code: vec![
+                ByteCode::LdaSmi as u8, 0,
+                ByteCode::JumpIfFalse as u8, 2,
+                ByteCode::LdaSmi as u8, 1,
+            ],
+            cons: vec![Value::from_smi(0), Value::from_smi(99)],
+            funcs: vec![],
+            func_map: HashMap::new(),
+            param_count: 0,
+            next_reg: 0,
+            symbols: HashMap::new(),
+        };
+        let mut vm = VM::new(Heap::new());
+        assert_eq!(vm.fde(&program), 0);
+    }
+
+    #[test]
+    fn test_jump_if_false_not_taken() {
+        // acc = 1 → JumpIfFalse not taken → LdaSmi loads 99
+        let program = Program {
+            code: vec![
+                ByteCode::LdaSmi as u8, 0,
+                ByteCode::JumpIfFalse as u8, 2,
+                ByteCode::LdaSmi as u8, 1,
+            ],
+            cons: vec![Value::from_smi(1), Value::from_smi(99)],
+            funcs: vec![],
+            func_map: HashMap::new(),
+            param_count: 0,
+            next_reg: 0,
+            symbols: HashMap::new(),
+        };
+        let mut vm = VM::new(Heap::new());
+        assert_eq!(vm.fde(&program), 99);
+    }
+
+    #[test]
+    fn string_equality_same() {
+        let mut heap = Heap::new();
+        let a = heap.alloc_string("hello");
+        let b = heap.alloc_string("hello");
+        let program = Program {
+            code: vec![
+                ByteCode::LdaSmi as u8, 0,
+                ByteCode::Star as u8, 0,
+                ByteCode::LdaSmi as u8, 1,
+                ByteCode::TestEqual as u8, 0,
+            ],
+            cons: vec![a, b],
+            funcs: vec![],
+            func_map: HashMap::new(),
+            param_count: 0,
+            next_reg: 0,
+            symbols: HashMap::new(),
+        };
+        let mut vm = VM::new(heap);
+        assert_eq!(vm.fde(&program), 1);
+    }
+
+    #[test]
+    fn string_equality_different() {
+        let mut heap = Heap::new();
+        let a = heap.alloc_string("hello");
+        let b = heap.alloc_string("world");
+        let program = Program {
+            code: vec![
+                ByteCode::LdaSmi as u8, 0,
+                ByteCode::Star as u8, 0,
+                ByteCode::LdaSmi as u8, 1,
+                ByteCode::TestEqual as u8, 0,
+            ],
+            cons: vec![a, b],
+            funcs: vec![],
+            func_map: HashMap::new(),
+            param_count: 0,
+            next_reg: 0,
+            symbols: HashMap::new(),
+        };
+        let mut vm = VM::new(heap);
+        assert_eq!(vm.fde(&program), 0);
+    }
+
+    #[test]
+    fn subtraction() {
+        let program = Program {
+            code: vec![
+                ByteCode::LdaSmi as u8, 0,
+                ByteCode::Star as u8, 0,
+                ByteCode::LdaSmi as u8, 1,
+                ByteCode::Sub as u8, 0,
+            ],
+            cons: vec![Value::from_smi(10), Value::from_smi(3)],
+            funcs: vec![],
+            func_map: HashMap::new(),
+            param_count: 0,
+            next_reg: 0,
+            symbols: HashMap::new(),
+        };
+        let mut vm = VM::new(Heap::new());
+        assert_eq!(vm.fde(&program), 7);
+    }
+
+    #[test]
+    fn division() {
+        let program = Program {
+            code: vec![
+                ByteCode::LdaSmi as u8, 0,
+                ByteCode::Star as u8, 0,
+                ByteCode::LdaSmi as u8, 1,
+                ByteCode::Div as u8, 0,
+            ],
+            cons: vec![Value::from_smi(20), Value::from_smi(4)],
+            funcs: vec![],
+            func_map: HashMap::new(),
+            param_count: 0,
+            next_reg: 0,
+            symbols: HashMap::new(),
+        };
+        let mut vm = VM::new(Heap::new());
+        assert_eq!(vm.fde(&program), 5);
     }
 }

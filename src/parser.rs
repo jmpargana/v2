@@ -166,8 +166,12 @@ impl Parser {
     fn parse_comparison(&mut self) -> Expr {
         let left = self.parse_additive();
         match self.peek() {
-            SymbolKind::Lt | SymbolKind::Gt | SymbolKind::Equal
-            | SymbolKind::Lte | SymbolKind::Gte | SymbolKind::NotEqual => {
+            SymbolKind::Lt
+            | SymbolKind::Gt
+            | SymbolKind::Equal
+            | SymbolKind::Lte
+            | SymbolKind::Gte
+            | SymbolKind::NotEqual => {
                 let op = match self.pop().kind {
                     SymbolKind::Lt => Op::Lt,
                     SymbolKind::Gt => Op::Gt,
@@ -191,7 +195,11 @@ impl Parser {
     fn parse_additive(&mut self) -> Expr {
         let mut left = self.parse_term();
         while matches!(self.peek(), SymbolKind::Add | SymbolKind::Sub) {
-            let op = if self.pop().kind == SymbolKind::Add { Op::Add } else { Op::Sub };
+            let op = if self.pop().kind == SymbolKind::Add {
+                Op::Add
+            } else {
+                Op::Sub
+            };
             let right = self.parse_term();
             left = Expr::Binary {
                 op,
@@ -205,7 +213,11 @@ impl Parser {
     fn parse_term(&mut self) -> Expr {
         let mut left = self.parse_factor();
         while matches!(self.peek(), SymbolKind::Mul | SymbolKind::Div) {
-            let op = if self.pop().kind == SymbolKind::Mul { Op::Mul } else { Op::Div };
+            let op = if self.pop().kind == SymbolKind::Mul {
+                Op::Mul
+            } else {
+                Op::Div
+            };
             let right = self.parse_factor();
             left = Expr::Binary {
                 op,
@@ -218,6 +230,10 @@ impl Parser {
 
     fn parse_factor(&mut self) -> Expr {
         match self.peek() {
+            SymbolKind::Str => {
+                let s = self.pop();
+                Expr::StringLit(s.str_val)
+            }
             SymbolKind::Smi => {
                 let s = self.pop();
                 Expr::NumberLit(s.int_val.unwrap())
@@ -600,6 +616,81 @@ mod tests {
                 body: vec![Stmt::Return(Expr::Ident("a".to_string()))],
                 alternate: Some(vec![Stmt::Return(Expr::Ident("b".to_string()))]),
             }]
+        );
+    }
+
+    fn str_lit(val: &str) -> Symbol {
+        Symbol {
+            kind: SymbolKind::Str,
+            int_val: None,
+            str_val: val.to_string(),
+        }
+    }
+
+    #[test]
+    fn string_literal_expression() {
+        let got = Parser::new(vec![str_lit("hello"), tok(SymbolKind::Semi)]).parse();
+        assert_eq!(
+            got,
+            vec![Stmt::ExprStmt(Expr::StringLit("hello".to_string()))]
+        );
+    }
+
+    #[test]
+    fn string_var_decl() {
+        let got = Parser::new(vec![
+            tok(SymbolKind::Let),
+            ident("name"),
+            tok(SymbolKind::Assign),
+            str_lit("alice"),
+            tok(SymbolKind::Semi),
+        ])
+        .parse();
+        assert_eq!(
+            got,
+            vec![Stmt::VarDecl {
+                kind: SymbolKind::Let,
+                name: "name".to_string(),
+                value: Expr::StringLit("alice".to_string()),
+            }]
+        );
+    }
+
+    #[test]
+    fn string_equality_comparison() {
+        let got = Parser::new(vec![
+            str_lit("a"),
+            tok(SymbolKind::Equal),
+            str_lit("b"),
+            tok(SymbolKind::Semi),
+        ])
+        .parse();
+        assert_eq!(
+            got,
+            vec![Stmt::ExprStmt(Expr::Bool {
+                op: Op::Equal,
+                left: Box::new(Expr::StringLit("a".to_string())),
+                right: Box::new(Expr::StringLit("b".to_string())),
+            })]
+        );
+    }
+
+    #[test]
+    fn string_as_function_argument() {
+        let got = Parser::new(vec![
+            ident("greet"),
+            tok(SymbolKind::LPar),
+            str_lit("world"),
+            tok(SymbolKind::RPar),
+            tok(SymbolKind::Semi),
+        ])
+        .parse();
+        assert_eq!(
+            got,
+            vec![Stmt::ExprStmt(Expr::Call {
+                func: "greet".to_string(),
+                args: vec![Expr::StringLit("world".to_string())],
+            })]
         );
     }
 

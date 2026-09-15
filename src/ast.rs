@@ -39,6 +39,7 @@ impl fmt::Display for Op {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Expr {
     NumberLit(i64),
+    StringLit(String),
     Ident(String),
     Bool {
         op: Op,
@@ -61,6 +62,7 @@ impl fmt::Display for Expr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Expr::NumberLit(v) => write!(f, "{}", v),
+            Expr::StringLit(v) => write!(f, "\"{}\"", v),
             Expr::Ident(name) => write!(f, "{}", name),
             Expr::Binary { op, left, right } => write!(f, "({} {} {})", left, op, right),
             Expr::Call { func, args } => {
