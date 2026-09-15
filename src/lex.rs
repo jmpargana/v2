@@ -4,7 +4,9 @@ use std::fmt;
 pub enum SymbolKind {
     Smi,
     Add,
+    Sub,
     Mul,
+    Div,
     LPar,
     RPar,
     LBrace,
@@ -31,7 +33,9 @@ impl fmt::Display for SymbolKind {
         match self {
             SymbolKind::Smi => write!(f, "SMI"),
             SymbolKind::Add => write!(f, "+"),
+            SymbolKind::Sub => write!(f, "-"),
             SymbolKind::Mul => write!(f, "*"),
+            SymbolKind::Div => write!(f, "/"),
             SymbolKind::LPar => write!(f, "("),
             SymbolKind::RPar => write!(f, ")"),
             SymbolKind::LBrace => write!(f, "{{"),
@@ -87,9 +91,25 @@ impl Lexer {
                     });
                     i += 1;
                 }
+                '-' => {
+                    res.push(Symbol {
+                        kind: SymbolKind::Sub,
+                        int_val: None,
+                        str_val: String::new(),
+                    });
+                    i += 1;
+                }
                 '*' => {
                     res.push(Symbol {
                         kind: SymbolKind::Mul,
+                        int_val: None,
+                        str_val: String::new(),
+                    });
+                    i += 1;
+                }
+                '/' => {
+                    res.push(Symbol {
+                        kind: SymbolKind::Div,
                         int_val: None,
                         str_val: String::new(),
                     });

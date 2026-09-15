@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Lesson 7: Tagged Values and the Heap</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<h1>Tagged Values and the Heap</h1>
+<p class="lesson-meta">Lesson 7 &middot; ~25 min &middot; Prerequisite: <a href="0006-control-flow.html">Lesson 6</a></p>
+
+<p>
+  Your VM speaks one language: <code>i64</code>. Every register, every constant,
+  every accumulator value is a 64-bit signed integer. That was enough for arithmetic,
+  variables, functions, and control flow. But to build an isolate, you need strings,
+  objects, arrays, booleans &mdash; all fitting through the same register-width slot.
+</p>
+<p>
+  This lesson introduces <strong>tagged pointers</strong> &mdash; V8&rsquo;s technique
+  for packing different value types into a single machine word. It also introduces
+  the <strong>heap</strong> &mdash; the byte array that will become the core of your isolate.
+</p>
+
+<h2>The Trick: Steal a Bit</h2>
+
+<p>
+  Every value in your VM will be a <code>u64</code>. The <strong>lowest bit</strong> is a
+  type tag that tells you what the remaining 63 bits mean:
+</p>
+
+<pre><code>Smi (small integer):
+  ┌──────────────────────────────────────────────────────────────┬───┐
+  │  63-bit signed integer value                                 │ 0 │
+  └──────────────────────────────────────────────────────────────┴───┘
+                                                              tag bit
+
+Heap object pointer:
+  ┌──────────────────────────────────────────────────────────────┬───┐
+  │  63-bit heap offset                                          │ 1 │
+  └──────────────────────────────────────────────────────────────┴───┘
+                                                              tag bit</code></pre>
+
+<p>
+  One <code>AND</code> instruction checks the type. One shift extracts the payload.
+  This is the cheapest possible type discrimination &mdash; a single bit test.
+</p>
+
+<div class="callout">
+  <strong>Why the lowest bit?</strong> Heap objects are always allocated at even byte offsets
+  (at minimum 2-byte aligned). Real offsets never have bit&nbsp;0 set, so V8 repurposes
+  it as a free tag bit. V8 calls this the <em>Smi tag</em> (0) and the
+  <em>HeapObject tag</em> (1). You&rsquo;ll find them defined as <code>kSmiTag</code> and
+  <code>kHeapObjectTag</code> in V8&rsquo;s <code>include/v8-internal.h</code>.
+</div>
+
+<h2>Encoding and Decoding</h2>
+
+<h3>Smis</h3>
+<p>To store integer <strong>42</strong> as a tagged value:</p>
+<pre><code>encode:  42 &lt;&lt; 1 = 84
+         binary: ...0101_010<strong>0</strong>
+                          tag bit ─┘    (0 = Smi)
+
+decode:  84 &gt;&gt; 1 = 42
+         (arithmetic shift &mdash; preserves sign for negatives)</code></pre>
+
+<h3>Heap Objects</h3>
+<p>To store a pointer to heap offset <strong>16</strong>:</p>
+<pre><code>encode:  (16 &lt;&lt; 1) | 1 = 33
+         binary: ...0010_000<strong>1</strong>
+                          tag bit ─┘    (1 = HeapObject)
+
+decode:  33 &gt;&gt; 1 = 16</code></pre>
+
+<p>
+  Both types decode with a right-shift by one. The tag bit is what you check <em>first</em>
+  to know which kind of value you&rsquo;re holding.
+</p>
+
+<div class="quiz" data-correct="0"
+     data-right="Correct! Bit 0 is 0, so it's a Smi. Decode: 42 >> 1 = 21."
+     data-wrong="Check bit 0 first. 42 in binary is 101010 — the lowest bit is 0, so it's a Smi. Then shift right to decode.">
+  <div class="quiz-question">
+    A register contains the raw value <code>42</code> (binary <code>101010</code>).
+    What does it represent?
+  </div>
+  <div class="quiz-options">
+    <div class="quiz-option">Smi with value 21</div>
+    <div class="quiz-option">Smi with value 42</div>
+    <div class="quiz-option">HeapObject at offset 21</div>
+    <div class="quiz-option">HeapObject at offset 42</div>
+  </div>
+  <div class="quiz-feedback"></div>
+</div>
+
+<h2>The Heap</h2>
+
+<p>
+  If a tagged value says &ldquo;heap object at offset 16&rdquo; &mdash; offset into <em>what</em>?
+  Into a <code>Vec&lt;u8&gt;</code> owned by the VM. This byte array <em>is</em> the heap.
+  Every heap-allocated object is a contiguous slice of it.
+</p>
+<p>
+  Each object starts with a <strong>type byte</strong> (what kind of object?),
+  followed by type-specific data. Here&rsquo;s what two strings look like in the heap:
+</p>
+
+<pre><code>Heap bytes:
+
+  offset 0:  [0x01] [05 00 00 00] [68 65 6C 6C 6F]
+              │      │              └── "hello" (UTF-8)
+              │      └── length: 5 (u32 little-endian)
+              └── type: String (0x01)
+
+  offset 10: [0x01] [05 00 00 00] [77 6F 72 6C 64]
+              │      │              └── "world" (UTF-8)
+              │      └── length: 5
+              └── type: String (0x01)</code></pre>
+
+<p>
+  A tagged value pointing to <code>"hello"</code> is <code>(0 &lt;&lt; 1) | 1 = <strong>1</strong></code>.
+  A tagged value pointing to <code>"world"</code> is <code>(10 &lt;&lt; 1) | 1 = <strong>21</strong></code>.
+</p>
+
+<div class="quiz" data-correct="2"
+     data-right="Correct! Bit 0 is 1, so it's a heap pointer. Decode: 33 >> 1 = 16. Look at heap offset 16 to find the object."
+     data-wrong="Check bit 0: 33 in binary is 100001 — lowest bit is 1, meaning HeapObject. Decode the offset with >> 1.">
+  <div class="quiz-question">
+    A register holds the raw value <code>33</code> (binary <code>100001</code>).
+    What does it represent?
+  </div>
+  <div class="quiz-options">
+    <div class="quiz-option">Smi with value 16</div>
+    <div class="quiz-option">Smi with value 33</div>
+    <div class="quiz-option">HeapObject at offset 16</div>
+    <div class="quiz-option">HeapObject at offset 33</div>
+  </div>
+  <div class="quiz-feedback"></div>
+</div>
+
+<h2>From Here to Isolates</h2>
+
+<p>Here&rsquo;s the key insight:</p>
+
+<pre><code>pub struct Isolate {
+    vm: VM,
+    heap: Heap,
+}</code></pre>
+
+<p>
+  <strong>An isolate is a VM that owns its own heap.</strong>
+</p>
+<p>
+  A tagged value with bit&nbsp;0&nbsp;=&nbsp;1 means &ldquo;look at offset X
+  <em>in my heap</em>.&rdquo; Two isolates can hold the same offset number, but they
+  point into different <code>Vec&lt;u8&gt;</code> arrays. Their worlds don&rsquo;t overlap.
+</p>
+
+<pre><code>Isolate A                         Isolate B
+┌─────────┐                       ┌─────────┐
+│  VM     │                       │  VM     │
+│  acc: 1 │─ ─ ─ ┐               │  acc: 1 │─ ─ ─ ┐
+└─────────┘      ▼               └─────────┘      ▼
+┌──────────────────┐             ┌──────────────────┐
+│ Heap A           │             │ Heap B           │
+│ offset 0: "foo"  │             │ offset 0: "bar"  │
+└──────────────────┘             └──────────────────┘
+
+Same tagged value (1), completely different data.</code></pre>
+
+<p>
+  No shared mutable state. No cross-isolate pointer chasing. No GC coordination between
+  isolates. This is how V8 runs multiple JavaScript contexts &mdash; tabs, workers,
+  extensions &mdash; inside a single OS process without them interfering with each other.
+</p>
+
+<div class="quiz" data-correct="1"
+     data-right="Correct! The heap offset is just an index into a Vec<u8>. Different isolates have different Vec<u8>s, so the same offset refers to different memory."
+     data-wrong="Think about what a heap offset actually points to. Each isolate has its own Vec<u8> — the same offset in two different arrays gives you different bytes.">
+  <div class="quiz-question">
+    Why can&rsquo;t two isolates share tagged values that point to heap objects?
+  </div>
+  <div class="quiz-options">
+    <div class="quiz-option">Tagged values are encrypted per isolate</div>
+    <div class="quiz-option">Heap offsets index into different byte arrays</div>
+    <div class="quiz-option">Each isolate uses a different tag bit convention</div>
+    <div class="quiz-option">Smis have different encodings per isolate</div>
+  </div>
+  <div class="quiz-feedback"></div>
+</div>
+
+<h2>Implementation</h2>
+
+<p>
+  Your task: create the <code>Value</code> type and <code>Heap</code> struct, then migrate
+  your VM from <code>i64</code> to <code>Value</code>. All 19 existing tests should still
+  pass &mdash; every current value is a Smi under the hood.
+</p>
+
+<h3>Step 1: <code>src/value.rs</code></h3>
+
+<p>Create a newtype over <code>u64</code>:</p>
+
+<pre><code>#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Value(u64);
+
+impl Value {
+    const TAG_MASK: u64 = 1;
+
+    // Smi: encode by shifting left 1 (tag bit = 0)
+    pub fn from_smi(n: i64) -> Value { ... }
+    pub fn is_smi(self) -> bool { ... }
+    pub fn as_smi(self) -> i64 { ... }
+
+    // Heap: encode by shifting left 1 and setting tag bit
+    pub fn from_heap(offset: usize) -> Value { ... }
+    pub fn is_heap_object(self) -> bool { ... }
+    pub fn heap_offset(self) -> usize { ... }
+}</code></pre>
+
+<p>
+  <code>Default</code> is important &mdash; <code>Value(0)</code> is Smi&nbsp;0, which lets you
+  initialize <code>[Value; 256]</code> register arrays.
+</p>
+
+<p><strong>Tests to write:</strong></p>
+<ul>
+  <li>Round-trip positive Smi: <code>Value::from_smi(42).as_smi() == 42</code></li>
+  <li>Round-trip negative Smi: <code>Value::from_smi(-7).as_smi() == -7</code></li>
+  <li>Round-trip zero: <code>Value::from_smi(0).as_smi() == 0</code></li>
+  <li>Smi discrimination: <code>Value::from_smi(42).is_smi() == true</code></li>
+  <li>Round-trip heap offset: <code>Value::from_heap(16).heap_offset() == 16</code></li>
+  <li>Heap discrimination: <code>Value::from_heap(16).is_heap_object() == true</code></li>
+  <li>Smi is not heap: <code>Value::from_smi(42).is_heap_object() == false</code></li>
+</ul>
+
+<h3>Step 2: <code>src/heap.rs</code></h3>
+
+<p>Create the heap &mdash; a byte array with typed object allocation:</p>
+
+<pre><code>pub struct Heap {
+    bytes: Vec&lt;u8&gt;,
+}
+
+#[repr(u8)]
+pub enum InstanceType {
+    String = 1,
+}
+
+impl Heap {
+    pub fn new() -> Self { ... }
+
+    pub fn alloc_string(&amp;mut self, s: &amp;str) -> Value {
+        let offset = self.bytes.len();
+        self.bytes.push(InstanceType::String as u8); // type byte
+        let len = s.len() as u32;
+        self.bytes.extend_from_slice(&amp;len.to_le_bytes()); // 4 bytes
+        self.bytes.extend_from_slice(s.as_bytes());        // payload
+        Value::from_heap(offset)
+    }
+
+    pub fn read_string(&amp;self, val: Value) -> &amp;str { ... }
+}</code></pre>
+
+<p>
+  For <code>read_string</code>: get the heap offset from the value, assert the type byte
+  is <code>InstanceType::String</code>, read the 4-byte length, then slice the UTF-8 bytes.
+</p>
+
+<p><strong>Tests to write:</strong></p>
+<ul>
+  <li>Allocate a string, read it back, verify contents match</li>
+  <li>Allocate two strings, verify they produce different <code>Value</code>s</li>
+  <li>Verify the returned values are heap objects (<code>.is_heap_object()</code>)</li>
+</ul>
+
+<h3>Step 3: Migrate the VM</h3>
+
+<p>Change <code>i64</code> to <code>Value</code> across your VM and compiler:</p>
+
+<table class="ref-table">
+  <thead>
+    <tr><th>Before</th><th>After</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>acc: i64</code></td><td><code>acc: Value</code></td></tr>
+    <tr><td><code>reg: [i64; 256]</code></td><td><code>reg: [Value; 256]</code></td></tr>
+    <tr><td><code>cons: Vec&lt;i64&gt;</code></td><td><code>cons: Vec&lt;Value&gt;</code></td></tr>
+    <tr><td><code>self.acc += reg</code></td><td><code>Value::from_smi(self.acc.as_smi() + reg.as_smi())</code></td></tr>
+  </tbody>
+</table>
+
+<p>
+  Arithmetic and comparison opcodes unwrap with <code>.as_smi()</code>, compute,
+  then wrap the result with <code>Value::from_smi()</code>. The compiler wraps constants
+  with <code>Value::from_smi()</code> when building the constant pool.
+</p>
+
+<p>
+  All 19 existing tests should pass with no logic changes &mdash; every value in your
+  current test suite is a Smi. The heap exists and is tested separately, ready for when
+  you add string literals to the language.
+</p>
+
+<div class="callout">
+  <strong>Primary source:</strong> V8&rsquo;s tagged value implementation lives in
+  <code>include/v8-internal.h</code> &mdash; search for <code>kSmiTag</code>,
+  <code>kHeapObjectTag</code>, and <code>kSmiTagMask</code>. For the bigger picture, read the
+  <a href="https://v8.dev/blog/pointer-compression">Pointer Compression in V8</a> blog post,
+  which explains how V8 evolved from 64-bit tagged pointers to compressed 32-bit ones.
+</div>
+
+<p>
+  Questions about tagging, the heap layout, or how this connects to isolates?
+  Ask your teacher &mdash; that&rsquo;s what I&rsquo;m here for.
+</p>
+
+<nav class="lesson-nav">
+  <a href="0006-control-flow.html">&larr; Lesson 6: Control Flow</a>
+  <a href="../reference/bytecode-instruction-set.html">Reference &rarr;</a>
+</nav>
+
+<footer>g8 teaching workspace</footer>
+
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

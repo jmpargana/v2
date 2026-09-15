@@ -55,7 +55,7 @@ impl Parser {
     }
 
     fn parse_conditional(&mut self) -> Stmt {
-        self.expect(SymbolKind::LPar);
+        self.expect(SymbolKind::If);
 
         self.expect(SymbolKind::LPar);
         let condition = self.parse_expr();
@@ -70,6 +70,7 @@ impl Parser {
 
         let mut alternate = None;
         if self.peek() == SymbolKind::Else {
+            self.pop();
             self.expect(SymbolKind::LBrace);
             let mut alternate_body = Vec::new();
             while self.peek() != SymbolKind::RBrace {
@@ -130,14 +131,34 @@ impl Parser {
         Stmt::ExprStmt(expr)
     }
 
-    // TODO: add boolean expression
     fn parse_expr(&mut self) -> Expr {
+        let left = self.parse_additive();
+        match self.peek() {
+            SymbolKind::Lt | SymbolKind::Gt | SymbolKind::Equal => {
+                let op = match self.pop().kind {
+                    SymbolKind::Lt => Op::Lt,
+                    SymbolKind::Gt => Op::Gt,
+                    SymbolKind::Equal => Op::Equal,
+                    _ => unreachable!(),
+                };
+                let right = self.parse_additive();
+                Expr::Bool {
+                    op,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                }
+            }
+            _ => left,
+        }
+    }
+
+    fn parse_additive(&mut self) -> Expr {
         let mut left = self.parse_term();
-        while self.peek() == SymbolKind::Add {
-            self.pop();
+        while matches!(self.peek(), SymbolKind::Add | SymbolKind::Sub) {
+            let op = if self.pop().kind == SymbolKind::Add { Op::Add } else { Op::Sub };
             let right = self.parse_term();
             left = Expr::Binary {
-                op: Op::Add,
+                op,
                 left: Box::new(left),
                 right: Box::new(right),
             };
@@ -147,11 +168,11 @@ impl Parser {
 
     fn parse_term(&mut self) -> Expr {
         let mut left = self.parse_factor();
-        while self.peek() == SymbolKind::Mul {
-            self.pop();
+        while matches!(self.peek(), SymbolKind::Mul | SymbolKind::Div) {
+            let op = if self.pop().kind == SymbolKind::Mul { Op::Mul } else { Op::Div };
             let right = self.parse_factor();
             left = Expr::Binary {
-                op: Op::Mul,
+                op,
                 left: Box::new(left),
                 right: Box::new(right),
             };
@@ -381,6 +402,163 @@ mod tests {
                 params: vec![],
                 body: vec![],
             },]
+        );
+    }
+
+    #[test]
+    fn boolean_expression_greater_than() {
+        let got = Parser::new(vec![
+            ident("a"),
+            tok(SymbolKind::Gt),
+            ident("b"),
+            tok(SymbolKind::Semi),
+        ])
+        .parse();
+        assert_eq!(
+            got,
+            vec![Stmt::ExprStmt(Expr::Bool {
+                op: Op::Gt,
+                left: Box::new(Expr::Ident("a".to_string())),
+                right: Box::new(Expr::Ident("b".to_string())),
+            })]
+        );
+    }
+
+    #[test]
+    fn boolean_expression_less_than() {
+        let got = Parser::new(vec![
+            smi(1),
+            tok(SymbolKind::Lt),
+            smi(2),
+            tok(SymbolKind::Semi),
+        ])
+        .parse();
+        assert_eq!(
+            got,
+            vec![Stmt::ExprStmt(Expr::Bool {
+                op: Op::Lt,
+                left: Box::new(Expr::NumberLit(1)),
+                right: Box::new(Expr::NumberLit(2)),
+            })]
+        );
+    }
+
+    #[test]
+    fn boolean_expression_equal() {
+        let got = Parser::new(vec![
+            ident("x"),
+            tok(SymbolKind::Equal),
+            smi(10),
+            tok(SymbolKind::Semi),
+        ])
+        .parse();
+        assert_eq!(
+            got,
+            vec![Stmt::ExprStmt(Expr::Bool {
+                op: Op::Equal,
+                left: Box::new(Expr::Ident("x".to_string())),
+                right: Box::new(Expr::NumberLit(10)),
+            })]
+        );
+    }
+
+    #[test]
+    fn comparison_with_arithmetic() {
+        // a + 1 > b * 2;
+        let got = Parser::new(vec![
+            ident("a"),
+            tok(SymbolKind::Add),
+            smi(1),
+            tok(SymbolKind::Gt),
+            ident("b"),
+            tok(SymbolKind::Mul),
+            smi(2),
+            tok(SymbolKind::Semi),
+        ])
+        .parse();
+        assert_eq!(
+            got,
+            vec![Stmt::ExprStmt(Expr::Bool {
+                op: Op::Gt,
+                left: Box::new(Expr::Binary {
+                    op: Op::Add,
+                    left: Box::new(Expr::Ident("a".to_string())),
+                    right: Box::new(Expr::NumberLit(1)),
+                }),
+                right: Box::new(Expr::Binary {
+                    op: Op::Mul,
+                    left: Box::new(Expr::Ident("b".to_string())),
+                    right: Box::new(Expr::NumberLit(2)),
+                }),
+            })]
+        );
+    }
+
+    #[test]
+    fn conditional_without_else() {
+        // if (a > b) { return a; }
+        let got = Parser::new(vec![
+            tok(SymbolKind::If),
+            tok(SymbolKind::LPar),
+            ident("a"),
+            tok(SymbolKind::Gt),
+            ident("b"),
+            tok(SymbolKind::RPar),
+            tok(SymbolKind::LBrace),
+            tok(SymbolKind::Return),
+            ident("a"),
+            tok(SymbolKind::Semi),
+            tok(SymbolKind::RBrace),
+        ])
+        .parse();
+        assert_eq!(
+            got,
+            vec![Stmt::Cond {
+                condition: Expr::Bool {
+                    op: Op::Gt,
+                    left: Box::new(Expr::Ident("a".to_string())),
+                    right: Box::new(Expr::Ident("b".to_string())),
+                },
+                body: vec![Stmt::Return(Expr::Ident("a".to_string()))],
+                alternate: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn conditional_with_else() {
+        // if (a > b) { return a; } else { return b; }
+        let got = Parser::new(vec![
+            tok(SymbolKind::If),
+            tok(SymbolKind::LPar),
+            ident("a"),
+            tok(SymbolKind::Gt),
+            ident("b"),
+            tok(SymbolKind::RPar),
+            tok(SymbolKind::LBrace),
+            tok(SymbolKind::Return),
+            ident("a"),
+            tok(SymbolKind::Semi),
+            tok(SymbolKind::RBrace),
+            tok(SymbolKind::Else),
+            tok(SymbolKind::LBrace),
+            tok(SymbolKind::Return),
+            ident("b"),
+            tok(SymbolKind::Semi),
+            tok(SymbolKind::RBrace),
+        ])
+        .parse();
+        assert_eq!(
+            got,
+            vec![Stmt::Cond {
+                condition: Expr::Bool {
+                    op: Op::Gt,
+                    left: Box::new(Expr::Ident("a".to_string())),
+                    right: Box::new(Expr::Ident("b".to_string())),
+                },
+                body: vec![Stmt::Return(Expr::Ident("a".to_string()))],
+                alternate: Some(vec![Stmt::Return(Expr::Ident("b".to_string()))]),
+            }]
         );
     }
 

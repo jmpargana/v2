@@ -1,9 +1,8 @@
-function max(a, b) {
-  if (a > b) {
-    return a;
-  } else {
-    return b;
+function factorial(n) {
+  if (n < 1) {
+    return 1;
   }
+  return n * factorial(n-1);
 }
 
-max(5, 10);
+factorial(10);

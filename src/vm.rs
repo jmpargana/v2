@@ -60,10 +60,20 @@ impl VM {
                     stack[fi].ip += 1;
                     self.acc += stack[fi].reg[idx];
                 }
+                ByteCode::Sub => {
+                    let idx = stack[fi].program.code[stack[fi].ip] as usize;
+                    stack[fi].ip += 1;
+                    self.acc = stack[fi].reg[idx] - self.acc;
+                }
                 ByteCode::Mul => {
                     let idx = stack[fi].program.code[stack[fi].ip] as usize;
                     stack[fi].ip += 1;
                     self.acc *= stack[fi].reg[idx];
+                }
+                ByteCode::Div => {
+                    let idx = stack[fi].program.code[stack[fi].ip] as usize;
+                    stack[fi].ip += 1;
+                    self.acc = stack[fi].reg[idx] / self.acc;
                 }
                 ByteCode::Call => {
                     let func_idx = stack[fi].program.code[stack[fi].ip] as usize;

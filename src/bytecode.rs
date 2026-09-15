@@ -7,17 +7,19 @@ use std::fmt::{self, Write};
 pub enum ByteCode {
     Push = 0,
     Add = 1,
-    Mul = 2,
-    LdaSmi = 3,
-    Ldar = 4,
-    Star = 5,
-    Call = 6,
-    Return = 7,
-    TestEqual = 8,
-    TestLess = 9,
-    TestGreater = 10,
-    Jump = 11,
-    JumpIfFalse = 12,
+    Sub = 2,
+    Mul = 3,
+    Div = 4,
+    LdaSmi = 5,
+    Ldar = 6,
+    Star = 7,
+    Call = 8,
+    Return = 9,
+    TestEqual = 10,
+    TestLess = 11,
+    TestGreater = 12,
+    Jump = 13,
+    JumpIfFalse = 14,
 }
 
 impl From<u8> for ByteCode {
@@ -25,17 +27,19 @@ impl From<u8> for ByteCode {
         match val {
             0 => ByteCode::Push,
             1 => ByteCode::Add,
-            2 => ByteCode::Mul,
-            3 => ByteCode::LdaSmi,
-            4 => ByteCode::Ldar,
-            5 => ByteCode::Star,
-            6 => ByteCode::Call,
-            7 => ByteCode::Return,
-            8 => ByteCode::TestEqual,
-            9 => ByteCode::TestLess,
-            10 => ByteCode::TestGreater,
-            11 => ByteCode::Jump,
-            12 => ByteCode::JumpIfFalse,
+            2 => ByteCode::Sub,
+            3 => ByteCode::Mul,
+            4 => ByteCode::Div,
+            5 => ByteCode::LdaSmi,
+            6 => ByteCode::Ldar,
+            7 => ByteCode::Star,
+            8 => ByteCode::Call,
+            9 => ByteCode::Return,
+            10 => ByteCode::TestEqual,
+            11 => ByteCode::TestLess,
+            12 => ByteCode::TestGreater,
+            13 => ByteCode::Jump,
+            14 => ByteCode::JumpIfFalse,
             _ => panic!("Unknown({})", val),
         }
     }
@@ -46,7 +50,9 @@ impl fmt::Display for ByteCode {
         match self {
             ByteCode::Push => write!(f, "Push"),
             ByteCode::Add => write!(f, "Add"),
+            ByteCode::Sub => write!(f, "Sub"),
             ByteCode::Mul => write!(f, "Mul"),
+            ByteCode::Div => write!(f, "Div"),
             ByteCode::LdaSmi => write!(f, "LdaSmi"),
             ByteCode::Ldar => write!(f, "Ldar"),
             ByteCode::Star => write!(f, "Star"),
@@ -182,8 +188,16 @@ impl Program {
                         self.code.push(ByteCode::Add as u8);
                         self.code.push(reg as u8);
                     }
+                    Op::Sub => {
+                        self.code.push(ByteCode::Sub as u8);
+                        self.code.push(reg as u8);
+                    }
                     Op::Mul => {
                         self.code.push(ByteCode::Mul as u8);
+                        self.code.push(reg as u8);
+                    }
+                    Op::Div => {
+                        self.code.push(ByteCode::Div as u8);
                         self.code.push(reg as u8);
                     }
                     _ => {
@@ -262,7 +276,7 @@ impl Program {
                                         .unwrap();
                                 }
                             }
-                            ByteCode::Star | ByteCode::Ldar | ByteCode::Add | ByteCode::Mul => {
+                            ByteCode::Star | ByteCode::Ldar | ByteCode::Add | ByteCode::Sub | ByteCode::Mul | ByteCode::Div => {
                                 writeln!(b, "{}  {:04}  {:<8} r{}", indent, i, op, operand)
                                     .unwrap();
                             }

@@ -4,7 +4,9 @@ use std::fmt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Op {
     Add,
+    Sub,
     Mul,
+    Div,
     Lt,
     Gt,
     Equal,
@@ -14,7 +16,9 @@ impl fmt::Display for Op {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Op::Add => write!(f, "+"),
+            Op::Sub => write!(f, "-"),
             Op::Mul => write!(f, "*"),
+            Op::Div => write!(f, "/"),
             Op::Lt => write!(f, "<"),
             Op::Gt => write!(f, ">"),
             Op::Equal => write!(f, "=="),
