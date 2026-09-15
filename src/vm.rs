@@ -1,5 +1,5 @@
-use std::fmt;
 use crate::bytecode::{ByteCode, Program};
+use std::fmt;
 
 struct Frame<'a> {
     ip: usize,
@@ -87,6 +87,32 @@ impl VM {
                 ByteCode::Push => {
                     stack[fi].ip += 1;
                 }
+                ByteCode::TestEqual => {
+                    let idx = stack[fi].program.code[stack[fi].ip] as usize;
+                    stack[fi].ip += 1;
+                    self.acc = if self.acc == stack[fi].reg[idx] { 1 } else { 0 };
+                }
+                ByteCode::TestLess => {
+                    let idx = stack[fi].program.code[stack[fi].ip] as usize;
+                    stack[fi].ip += 1;
+                    self.acc = if self.acc > stack[fi].reg[idx] { 1 } else { 0 };
+                }
+                ByteCode::TestGreater => {
+                    let idx = stack[fi].program.code[stack[fi].ip] as usize;
+                    stack[fi].ip += 1;
+                    self.acc = if self.acc < stack[fi].reg[idx] { 1 } else { 0 };
+                }
+                ByteCode::Jump => {
+                    let offset = stack[fi].program.code[stack[fi].ip];
+                    stack[fi].ip += offset as usize + 1;
+                }
+                ByteCode::JumpIfFalse => {
+                    let offset = stack[fi].program.code[stack[fi].ip];
+                    stack[fi].ip += 1;
+                    if self.acc == 0 {
+                        stack[fi].ip += offset as usize;
+                    }
+                }
             }
         }
 
@@ -104,13 +130,20 @@ mod tests {
     fn first_example() {
         let program = Program {
             code: vec![
-                ByteCode::LdaSmi as u8, 0,
-                ByteCode::Star as u8, 0,
-                ByteCode::LdaSmi as u8, 1,
-                ByteCode::Star as u8, 1,
-                ByteCode::LdaSmi as u8, 2,
-                ByteCode::Mul as u8, 1,
-                ByteCode::Add as u8, 0,
+                ByteCode::LdaSmi as u8,
+                0,
+                ByteCode::Star as u8,
+                0,
+                ByteCode::LdaSmi as u8,
+                1,
+                ByteCode::Star as u8,
+                1,
+                ByteCode::LdaSmi as u8,
+                2,
+                ByteCode::Mul as u8,
+                1,
+                ByteCode::Add as u8,
+                0,
             ],
             cons: vec![30, 20, 40],
             funcs: vec![],
@@ -128,33 +161,37 @@ mod tests {
     fn with_function_call() {
         let program = Program {
             code: vec![
-                ByteCode::LdaSmi as u8, 0,
-                ByteCode::Star as u8, 0,
-                ByteCode::LdaSmi as u8, 1,
-                ByteCode::Star as u8, 1,
-                ByteCode::Call as u8, 0,
+                ByteCode::LdaSmi as u8,
+                0,
+                ByteCode::Star as u8,
+                0,
+                ByteCode::LdaSmi as u8,
+                1,
+                ByteCode::Star as u8,
+                1,
+                ByteCode::Call as u8,
+                0,
             ],
             cons: vec![10, 20],
-            funcs: vec![
-                Program {
-                    code: vec![
-                        ByteCode::Ldar as u8, 0,
-                        ByteCode::Star as u8, 2,
-                        ByteCode::Ldar as u8, 1,
-                        ByteCode::Add as u8, 2,
-                        ByteCode::Return as u8,
-                    ],
-                    cons: vec![],
-                    param_count: 2,
-                    next_reg: 3,
-                    symbols: HashMap::from([
-                        ("a".to_string(), 0),
-                        ("b".to_string(), 1),
-                    ]),
-                    funcs: vec![],
-                    func_map: HashMap::new(),
-                },
-            ],
+            funcs: vec![Program {
+                code: vec![
+                    ByteCode::Ldar as u8,
+                    0,
+                    ByteCode::Star as u8,
+                    2,
+                    ByteCode::Ldar as u8,
+                    1,
+                    ByteCode::Add as u8,
+                    2,
+                    ByteCode::Return as u8,
+                ],
+                cons: vec![],
+                param_count: 2,
+                next_reg: 3,
+                symbols: HashMap::from([("a".to_string(), 0), ("b".to_string(), 1)]),
+                funcs: vec![],
+                func_map: HashMap::new(),
+            }],
             func_map: HashMap::from([("add".to_string(), 0)]),
             param_count: 0,
             next_reg: 2,

@@ -1,6 +1,6 @@
+use crate::ast::{Expr, Op, Stmt};
 use std::collections::HashMap;
 use std::fmt::{self, Write};
-use crate::ast::{Expr, Stmt, Op};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -13,6 +13,11 @@ pub enum ByteCode {
     Star = 5,
     Call = 6,
     Return = 7,
+    TestEqual = 8,
+    TestLess = 9,
+    TestGreater = 10,
+    Jump = 11,
+    JumpIfFalse = 12,
 }
 
 impl From<u8> for ByteCode {
@@ -26,6 +31,11 @@ impl From<u8> for ByteCode {
             5 => ByteCode::Star,
             6 => ByteCode::Call,
             7 => ByteCode::Return,
+            8 => ByteCode::TestEqual,
+            9 => ByteCode::TestLess,
+            10 => ByteCode::TestGreater,
+            11 => ByteCode::Jump,
+            12 => ByteCode::JumpIfFalse,
             _ => panic!("Unknown({})", val),
         }
     }
@@ -42,6 +52,11 @@ impl fmt::Display for ByteCode {
             ByteCode::Star => write!(f, "Star"),
             ByteCode::Call => write!(f, "Call"),
             ByteCode::Return => write!(f, "Return"),
+            ByteCode::TestEqual => write!(f, "TestEqual"),
+            ByteCode::TestLess => write!(f, "TestLess"),
+            ByteCode::TestGreater => write!(f, "TestGreater"),
+            ByteCode::Jump => write!(f, "Jump"),
+            ByteCode::JumpIfFalse => write!(f, "JumpIfFalse"),
         }
     }
 }
@@ -110,8 +125,37 @@ impl Program {
                 Stmt::ExprStmt(expr) => {
                     self.compile_expr(expr);
                 }
+                Stmt::Cond {
+                    condition,
+                    body,
+                    alternate,
+                } => {
+                    self.compile_expr(condition);
+                    let jump_false = self.emit_jump(ByteCode::JumpIfFalse);
+                    self.compile(body);
+
+                    if alternate.is_some() {
+                        let jump = self.emit_jump(ByteCode::Jump);
+                        self.patch_jump(jump_false);
+                        self.compile(alternate.as_ref().unwrap());
+                        self.patch_jump(jump);
+                    } else {
+                        self.patch_jump(jump_false);
+                    }
+                }
             }
         }
+    }
+
+    fn patch_jump(&mut self, placeholder: usize) {
+        let offset = self.code.len() - placeholder - 1;
+        self.code[placeholder] = offset as u8;
+    }
+
+    fn emit_jump(&mut self, op: ByteCode) -> usize {
+        self.code.push(op as u8);
+        self.code.push(0);
+        self.code.len() - 1
     }
 
     fn compile_expr(&mut self, expr: &Expr) {
@@ -142,6 +186,9 @@ impl Program {
                         self.code.push(ByteCode::Mul as u8);
                         self.code.push(reg as u8);
                     }
+                    _ => {
+                        panic!("ignoring bool logic for now");
+                    }
                 }
             }
             Expr::Call { func, args } => {
@@ -154,6 +201,21 @@ impl Program {
                 self.code.push(ByteCode::Call as u8);
                 self.code.push(self.func_map[func] as u8);
             }
+            Expr::Bool { op, left, right } => {
+                self.compile_expr(left);
+                let reg = self.alloc_reg();
+                self.code.push(ByteCode::Star as u8);
+                self.code.push(reg as u8);
+                self.compile_expr(right);
+                let op_byte_code = match op {
+                    Op::Lt => ByteCode::TestLess,
+                    Op::Gt => ByteCode::TestGreater,
+                    Op::Equal => ByteCode::TestEqual,
+                    _ => panic!("impossible"),
+                } as u8;
+                self.code.push(op_byte_code);
+                self.code.push(reg as u8);
+            }
         }
     }
 
@@ -164,7 +226,12 @@ impl Program {
     fn string_indent(&self, indent: &str) -> String {
         let mut b = String::new();
         writeln!(b, "{}Constants: {:?}", indent, self.cons).unwrap();
-        writeln!(b, "{}Registers: {}, Params: {}", indent, self.next_reg, self.param_count).unwrap();
+        writeln!(
+            b,
+            "{}Registers: {}, Params: {}",
+            indent, self.next_reg, self.param_count
+        )
+        .unwrap();
         if !self.func_map.is_empty() {
             writeln!(b, "{}FuncMap: {:?}", indent, self.func_map).unwrap();
         }
@@ -184,22 +251,37 @@ impl Program {
                         match op {
                             ByteCode::LdaSmi | ByteCode::Push => {
                                 if operand < self.cons.len() {
-                                    writeln!(b, "{}  {:04}  {:<8} [{}] ({})", indent, i, op, operand, self.cons[operand]).unwrap();
+                                    writeln!(
+                                        b,
+                                        "{}  {:04}  {:<8} [{}] ({})",
+                                        indent, i, op, operand, self.cons[operand]
+                                    )
+                                    .unwrap();
                                 } else {
-                                    writeln!(b, "{}  {:04}  {:<8} [{}]", indent, i, op, operand).unwrap();
+                                    writeln!(b, "{}  {:04}  {:<8} [{}]", indent, i, op, operand)
+                                        .unwrap();
                                 }
                             }
                             ByteCode::Star | ByteCode::Ldar | ByteCode::Add | ByteCode::Mul => {
-                                writeln!(b, "{}  {:04}  {:<8} r{}", indent, i, op, operand).unwrap();
+                                writeln!(b, "{}  {:04}  {:<8} r{}", indent, i, op, operand)
+                                    .unwrap();
                             }
                             ByteCode::Call => {
-                                let name = self.func_map.iter()
+                                let name = self
+                                    .func_map
+                                    .iter()
                                     .find(|&(_, &v)| v == operand)
                                     .map(|(k, _)| k.as_str());
                                 if let Some(name) = name {
-                                    writeln!(b, "{}  {:04}  {:<8} [{}] ({})", indent, i, op, operand, name).unwrap();
+                                    writeln!(
+                                        b,
+                                        "{}  {:04}  {:<8} [{}] ({})",
+                                        indent, i, op, operand, name
+                                    )
+                                    .unwrap();
                                 } else {
-                                    writeln!(b, "{}  {:04}  {:<8} [{}]", indent, i, op, operand).unwrap();
+                                    writeln!(b, "{}  {:04}  {:<8} [{}]", indent, i, op, operand)
+                                        .unwrap();
                                 }
                             }
                             _ => {
@@ -216,7 +298,9 @@ impl Program {
         }
 
         for (idx, func) in self.funcs.iter().enumerate() {
-            let name = self.func_map.iter()
+            let name = self
+                .func_map
+                .iter()
                 .find(|&(_, &v)| v == idx)
                 .map(|(k, _)| k.as_str());
             if let Some(name) = name {
@@ -240,8 +324,8 @@ impl fmt::Display for Program {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ast::{Expr, Op, Stmt};
     use crate::lex::SymbolKind;
-    use crate::ast::{Expr, Stmt, Op};
 
     #[test]
     fn example_from_lesson() {
@@ -273,17 +357,28 @@ mod tests {
         let mut want = Program::new();
         want.cons = vec![10, 20];
         want.code = vec![
-            ByteCode::LdaSmi as u8, 0,
-            ByteCode::Star as u8, 0,
-            ByteCode::LdaSmi as u8, 1,
-            ByteCode::Star as u8, 1,
-            ByteCode::Ldar as u8, 0,
-            ByteCode::Add as u8, 1,
-            ByteCode::Star as u8, 2,
-            ByteCode::Ldar as u8, 0,
-            ByteCode::Star as u8, 3,
-            ByteCode::Ldar as u8, 2,
-            ByteCode::Mul as u8, 3,
+            ByteCode::LdaSmi as u8,
+            0,
+            ByteCode::Star as u8,
+            0,
+            ByteCode::LdaSmi as u8,
+            1,
+            ByteCode::Star as u8,
+            1,
+            ByteCode::Ldar as u8,
+            0,
+            ByteCode::Add as u8,
+            1,
+            ByteCode::Star as u8,
+            2,
+            ByteCode::Ldar as u8,
+            0,
+            ByteCode::Star as u8,
+            3,
+            ByteCode::Ldar as u8,
+            2,
+            ByteCode::Mul as u8,
+            3,
         ];
 
         assert!(got.equals(&want), "got:\n{}\nwant:\n{}", got, want);
@@ -295,13 +390,11 @@ mod tests {
             Stmt::FuncDecl {
                 name: "add".to_string(),
                 params: vec!["a".to_string(), "b".to_string()],
-                body: vec![
-                    Stmt::Return(Expr::Binary {
-                        op: Op::Add,
-                        left: Box::new(Expr::Ident("a".to_string())),
-                        right: Box::new(Expr::Ident("b".to_string())),
-                    }),
-                ],
+                body: vec![Stmt::Return(Expr::Binary {
+                    op: Op::Add,
+                    left: Box::new(Expr::Ident("a".to_string())),
+                    right: Box::new(Expr::Ident("b".to_string())),
+                })],
             },
             Stmt::ExprStmt(Expr::Call {
                 func: "add".to_string(),
@@ -315,11 +408,16 @@ mod tests {
         let mut want = Program::new();
         want.cons = vec![10, 20];
         want.code = vec![
-            ByteCode::LdaSmi as u8, 0,
-            ByteCode::Star as u8, 0,
-            ByteCode::LdaSmi as u8, 1,
-            ByteCode::Star as u8, 1,
-            ByteCode::Call as u8, 0,
+            ByteCode::LdaSmi as u8,
+            0,
+            ByteCode::Star as u8,
+            0,
+            ByteCode::LdaSmi as u8,
+            1,
+            ByteCode::Star as u8,
+            1,
+            ByteCode::Call as u8,
+            0,
         ];
 
         assert!(got.equals(&want), "got:\n{}\nwant:\n{}", got, want);
