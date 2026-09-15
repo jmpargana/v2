@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Lesson 8: Garbage Collection</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<h1>Garbage Collection</h1>
+<p class="lesson-meta">Lesson 8 &middot; ~30 min &middot; Prerequisite: <a href="0007-tagged-values-and-the-heap.html">Lesson 7</a></p>
+
+<p>
+  Your heap has a problem: it only grows. Every <code>alloc_string</code> appends bytes, and
+  nothing ever reclaims them. Run a loop that allocates strings, and your <code>Vec&lt;u8&gt;</code>
+  grows without bound.
+</p>
+<p>
+  This lesson introduces <strong>garbage collection</strong> &mdash; the mechanism that
+  identifies dead heap objects and reclaims their memory. You&rsquo;ll implement a
+  <strong>mark-compact</strong> collector: find what&rsquo;s alive, copy it to a fresh heap,
+  and throw the rest away.
+</p>
+
+<h2>What&rsquo;s Alive?</h2>
+
+<p>
+  An object is <strong>alive</strong> if any running code can still reach it. The starting
+  points for reachability are called <strong>roots</strong> &mdash; the values the VM is
+  actively using:
+</p>
+
+<ul>
+  <li>The <strong>accumulator</strong> (<code>vm.acc</code>)</li>
+  <li>Every <strong>register</strong> in every active call frame (<code>frame.reg[0..256]</code>)</li>
+  <li>Every <strong>constant</strong> in every loaded program (<code>program.cons</code>)</li>
+</ul>
+
+<p>
+  If a root holds a tagged Value with bit&nbsp;0&nbsp;=&nbsp;1, the heap object at that offset
+  is alive. Everything else is garbage.
+</p>
+
+<div class="callout">
+  <strong>Simplification:</strong> Your heap objects (strings) don&rsquo;t reference other heap
+  objects. That means reachability is flat &mdash; just check the roots directly, no recursive
+  traversal needed. When you later add objects with properties (which hold Values that might
+  themselves be heap pointers), you&rsquo;ll need to <em>walk</em> the object graph recursively.
+  For now, roots are enough.
+</div>
+
+<h2>The Algorithm: Mark and Compact</h2>
+
+<p>Three phases:</p>
+
+<h3>Phase 1 &mdash; Mark</h3>
+<p>Scan every root. Collect the heap offsets of all live objects into a set.</p>
+
+<pre><code>roots:  [Smi(10), HeapObj(@0), Smi(5), HeapObj(@15), HeapObj(@0)]
+                       │                     │              │
+live offsets:        { 0, 15 }       (duplicates ignored)</code></pre>
+
+<h3>Phase 2 &mdash; Compact</h3>
+<p>
+  Walk the heap from offset 0 to the end. For each object, check if it&rsquo;s in the
+  live set. If yes, copy it to a new <code>Vec&lt;u8&gt;</code> and record where it moved.
+  If no, skip it.
+</p>
+
+<pre><code>Old heap:
+  @0:  [String "hello"]  (10 bytes) &mdash; LIVE
+  @10: [String "temp"]   (9 bytes)  &mdash; DEAD
+  @19: [String "world"]  (10 bytes) &mdash; LIVE
+
+New heap (compacted):
+  @0:  [String "hello"]  (10 bytes)
+  @10: [String "world"]  (10 bytes)
+
+Remap:  { 0 &rarr; 0,  19 &rarr; 10 }</code></pre>
+
+<p>
+  The dead string <code>"temp"</code> at offset 10 is gone. <code>"world"</code> moved from
+  offset 19 to offset 10. The heap shrank from 29 bytes to 20.
+</p>
+
+<h3>Phase 3 &mdash; Update pointers</h3>
+<p>
+  Every root that held a heap pointer needs its offset updated according to the remap.
+  A register that held <code>Value::from_heap(19)</code> now holds <code>Value::from_heap(10)</code>.
+</p>
+
+<div class="quiz" data-correct="1"
+     data-right="Correct! If no root points to it, no code can ever access it again — it's unreachable, so it's garbage."
+     data-wrong="Think about it from the VM's perspective. The VM can only reach values through its accumulator, registers, and constant pools. If none of those hold a pointer to the object, there's no way to get to it.">
+  <div class="quiz-question">
+    A heap object was allocated inside a function and stored in register r3.
+    After the function returns and its frame is popped, what happens to that object?
+  </div>
+  <div class="quiz-options">
+    <div class="quiz-option">It stays alive until the program ends</div>
+    <div class="quiz-option">It becomes garbage on the next GC cycle</div>
+    <div class="quiz-option">It is freed immediately when the frame pops</div>
+    <div class="quiz-option">It moves to the caller&rsquo;s frame automatically</div>
+  </div>
+  <div class="quiz-feedback"></div>
+</div>
+
+<h2>Walking the Heap</h2>
+
+<p>
+  To compact, you need to iterate through objects in the heap. But the heap is a raw
+  <code>Vec&lt;u8&gt;</code> &mdash; how do you know where one object ends and the next begins?
+</p>
+<p>
+  Each object is <strong>self-describing</strong>: the type byte tells you the object&rsquo;s
+  kind, and from that you can compute its total size in bytes. For strings:
+</p>
+
+<pre><code>object_size(offset):
+  type_byte = heap[offset]       // 1 = String
+  match type_byte:
+    String:
+      len = u32 from heap[offset+1 .. offset+5]
+      total = 1 + 4 + len         // type + length + data
+</code></pre>
+
+<p>
+  With <code>object_size</code>, you can walk the entire heap:
+  start at offset 0, compute size, jump forward, repeat until you reach the end.
+  This is how GCs iterate through all objects &mdash; the heap is a flat
+  array of self-describing objects.
+</p>
+
+<div class="quiz" data-correct="2"
+     data-right="Correct! 1 byte (type) + 4 bytes (u32 length) + 3 bytes ('foo') = 8 bytes total."
+     data-wrong="Count the bytes: type byte (1) + length as u32 (4) + the string data. 'foo' is 3 bytes of UTF-8.">
+  <div class="quiz-question">
+    A String object holding <code>"foo"</code> starts at heap offset 20. What is the offset of the
+    next object after it?
+  </div>
+  <div class="quiz-options">
+    <div class="quiz-option">Offset 23 (20 + 3 bytes of data)</div>
+    <div class="quiz-option">Offset 27 (20 + 4 length + 3 data)</div>
+    <div class="quiz-option">Offset 28 (20 + 1 type + 4 length + 3 data)</div>
+    <div class="quiz-option">Offset 24 (20 + 4 length)</div>
+  </div>
+  <div class="quiz-feedback"></div>
+</div>
+
+<h2>Why Compact Instead of Free-in-Place?</h2>
+
+<p>
+  You could mark dead objects and add them to a <em>free list</em> &mdash; track the gaps
+  and reuse them later. That&rsquo;s what <strong>mark-sweep</strong> does. But it has a
+  problem: <strong>fragmentation</strong>. After many allocations and sweeps, the heap becomes
+  a patchwork of small free regions that can&rsquo;t hold large objects even though the total
+  free space is enough.
+</p>
+<p>
+  <strong>Mark-compact</strong> avoids this by rebuilding the heap with all live objects
+  packed together. Allocation stays simple: always append to the end.
+  The tradeoff is that every collection copies all live objects and updates all pointers,
+  which is O(live data). For V8&rsquo;s young generation (Scavenger), this is fine &mdash;
+  most young objects die quickly, so there&rsquo;s very little to copy.
+</p>
+
+<h2>Implementation</h2>
+
+<h3>Step 1: <code>Heap::object_size</code></h3>
+
+<p>Add a method that calculates the total byte size of the object at a given offset:</p>
+<pre><code>fn object_size(&amp;self, offset: usize) -> usize {
+    match self.bytes[offset] {
+        1 => { // InstanceType::String
+            let len_bytes: [u8; 4] = self.bytes[offset+1..offset+5]
+                .try_into().unwrap();
+            let len = u32::from_le_bytes(len_bytes) as usize;
+            1 + 4 + len
+        }
+        t => panic!("unknown object type {} at offset {}", t, offset),
+    }
+}</code></pre>
+
+<p><strong>Test:</strong> allocate a string, verify <code>object_size(0)</code> returns the right value.</p>
+
+<h3>Step 2: <code>Heap::collect</code></h3>
+
+<p>
+  Takes a set of live heap offsets (from the mark phase), compacts the heap,
+  and returns the offset remap so the caller can update its pointers:
+</p>
+
+<pre><code>use std::collections::{HashMap, HashSet};
+
+pub fn collect(
+    &amp;mut self,
+    live: &amp;HashSet&lt;usize&gt;,
+) -> HashMap&lt;usize, usize&gt; {
+    let mut new_bytes = Vec::new();
+    let mut remap = HashMap::new();
+    let mut pos = 0;
+
+    while pos < self.bytes.len() {
+        let size = self.object_size(pos);
+        if live.contains(&amp;pos) {
+            let new_offset = new_bytes.len();
+            remap.insert(pos, new_offset);
+            new_bytes.extend_from_slice(
+                &amp;self.bytes[pos..pos + size]
+            );
+        }
+        pos += size;
+    }
+
+    self.bytes = new_bytes;
+    remap
+}</code></pre>
+
+<p>
+  The caller (the VM) is responsible for two things:
+</p>
+<ol>
+  <li>Building the <code>live</code> set by scanning its roots</li>
+  <li>Applying the <code>remap</code> to every Value it holds</li>
+</ol>
+
+<h3>Step 3: VM integration</h3>
+
+<p>
+  Add a <code>collect_garbage</code> method to the VM that orchestrates the three phases.
+  The tricky part is gathering all roots &mdash; the accumulator, every register in every
+  active frame, and every constant in the program tree:
+</p>
+
+<pre><code>fn collect_garbage(
+    &amp;mut self,
+    stack: &amp;mut Vec&lt;Frame&gt;,
+    program: &amp;mut Program,
+) {
+    // Phase 1: Mark — find all live heap offsets
+    let mut live = HashSet::new();
+    if self.acc.is_heap_object() {
+        live.insert(self.acc.heap_offset());
+    }
+    for frame in stack.iter() {
+        for val in frame.reg.iter() {
+            if val.is_heap_object() {
+                live.insert(val.heap_offset());
+            }
+        }
+    }
+    // Also scan constant pools (they hold heap pointers to string literals)
+    Self::scan_program_cons(program, &amp;mut live);
+
+    // Phase 2: Compact
+    let remap = self.heap.collect(&amp;live);
+
+    // Phase 3: Update pointers
+    Self::remap_value(&amp;mut self.acc, &amp;remap);
+    for frame in stack.iter_mut() {
+        for val in frame.reg.iter_mut() {
+            Self::remap_value(val, &amp;remap);
+        }
+    }
+    Self::remap_program_cons(program, &amp;remap);
+}
+
+fn remap_value(val: &amp;mut Value, remap: &amp;HashMap&lt;usize, usize&gt;) {
+    if val.is_heap_object() {
+        if let Some(&amp;new_offset) = remap.get(&amp;val.heap_offset()) {
+            *val = Value::from_heap(new_offset);
+        }
+    }
+}</code></pre>
+
+<p>
+  You&rsquo;ll also need helper methods to scan and remap constant pools across the
+  program tree (the main program and all its nested function programs).
+</p>
+
+<h3>Step 4: Triggering collection</h3>
+
+<p>
+  When should the GC run? Two common strategies:
+</p>
+
+<ul>
+  <li><strong>Allocation threshold:</strong> collect when <code>heap.bytes.len()</code> exceeds
+      some limit (e.g., 1024 bytes). After collection, double the threshold if the heap
+      is still &gt;50% full.</li>
+  <li><strong>Allocation count:</strong> collect every N allocations. Simpler but less
+      adaptive.</li>
+</ul>
+
+<p>
+  Start with a byte threshold. Add a <code>threshold</code> field to Heap, check it in
+  <code>alloc_string</code>, and call back into the VM&rsquo;s collect method when exceeded.
+</p>
+
+<div class="callout warn">
+  <strong>Rust ownership note:</strong> The GC needs mutable access to the heap, the frame stack,
+  and the program simultaneously. Your current <code>fde</code> method borrows
+  <code>&amp;Program</code> immutably. To update constant pools during GC, you&rsquo;ll either
+  need to make that borrow mutable, or separate the constant pool from the Program struct.
+  This is a real design tension &mdash; V8 solves it by having a dedicated GC phase where
+  the mutator (running code) is paused and the entire heap + roots are accessible. In Rust,
+  you&rsquo;re forced to make this explicit. It&rsquo;s a good first taste of the constraints
+  that shape real GC implementations.
+</div>
+
+<h3>Tests to write</h3>
+
+<ul>
+  <li><strong>Compact removes dead objects:</strong> allocate 3 strings, build a live set with
+      only 2 of them, collect, verify the heap shrank and the remap is correct</li>
+  <li><strong>Remap updates values:</strong> create Values pointing to objects, apply the remap,
+      verify <code>heap.read_string</code> still returns the correct strings</li>
+  <li><strong>Empty live set:</strong> collect with no roots &mdash; heap should be empty after</li>
+  <li><strong>All live:</strong> collect with all objects live &mdash; heap size unchanged, remap
+      maps each offset to itself (or a new contiguous offset)</li>
+</ul>
+
+<div class="quiz" data-correct="2"
+     data-right="Correct! Mark-compact copies all live objects to a new contiguous region, eliminating gaps. The cost is proportional to the amount of live data, and all pointers must be updated."
+     data-wrong="Think about what happens to the gaps left by dead objects. Mark-sweep leaves them (fragmentation). Mark-compact eliminates them by copying.">
+  <div class="quiz-question">
+    What is the main advantage of mark-compact over mark-sweep?
+  </div>
+  <div class="quiz-options">
+    <div class="quiz-option">Mark-compact is faster because it doesn&rsquo;t scan roots</div>
+    <div class="quiz-option">Mark-compact can free individual objects immediately</div>
+    <div class="quiz-option">Mark-compact eliminates heap fragmentation</div>
+    <div class="quiz-option">Mark-compact doesn&rsquo;t need to update pointers</div>
+  </div>
+  <div class="quiz-feedback"></div>
+</div>
+
+<h2>How V8 Does It</h2>
+
+<p>
+  V8 uses a <strong>generational</strong> garbage collector based on the observation that
+  most objects die young (the <em>generational hypothesis</em>):
+</p>
+
+<ul>
+  <li><strong>Young generation (Scavenger):</strong> A semi-space copying collector. Two
+      equal halves &mdash; allocate in one, copy survivors to the other, swap. Very fast
+      because most young objects are garbage. This is closest to what you&rsquo;re building.</li>
+  <li><strong>Old generation (Major GC):</strong> Mark-sweep-compact. Objects that survive
+      multiple young-gen collections get promoted here. Collected less frequently.</li>
+</ul>
+
+<p>
+  Your mark-compact collector is a simplified version of both &mdash; it copies
+  survivors (like the Scavenger) and compacts (like the major GC). As your VM grows,
+  you could split the heap into two generations. For now, one collector is enough.
+</p>
+
+<div class="callout">
+  <strong>Primary source:</strong> Read Chapter 26 of
+  <a href="https://craftinginterpreters.com/garbage-collection.html">Crafting Interpreters</a>
+  by Bob Nystrom &mdash; it implements mark-sweep for a simple VM in C, walking through every
+  design decision. For V8 specifically, the
+  <a href="https://v8.dev/blog/trash-talk">Trash talk: the Orinoco garbage collector</a>
+  blog post covers the generational design, concurrent marking, and incremental compaction.
+</div>
+
+<p>
+  Questions about roots, the compact algorithm, or how to handle the Rust ownership
+  constraints? Ask your teacher.
+</p>
+
+<nav class="lesson-nav">
+  <a href="0007-tagged-values-and-the-heap.html">&larr; Lesson 7: Tagged Values</a>
+  <a href="../reference/bytecode-instruction-set.html">Reference &rarr;</a>
+</nav>
+
+<footer>g8 teaching workspace</footer>
+
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

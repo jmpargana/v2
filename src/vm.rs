@@ -30,7 +30,15 @@ impl VM {
         }
     }
 
-    pub fn fde(&mut self, program: &Program) -> i64 {
+    pub fn format_value(&self, val: Value) -> String {
+        if val.is_smi() {
+            val.as_smi().to_string()
+        } else {
+            self.heap.read_string(val).to_string()
+        }
+    }
+
+    pub fn fde(&mut self, program: &Program) -> Value {
         let mut stack: Vec<Frame> = vec![Frame {
             ip: 0,
             reg: [Default::default(); 256],
@@ -66,7 +74,15 @@ impl VM {
                 ByteCode::Add => {
                     let idx = stack[fi].program.code[stack[fi].ip] as usize;
                     stack[fi].ip += 1;
-                    self.acc = Value::from_smi(self.acc.as_smi() + stack[fi].reg[idx].as_smi())
+                    if self.acc.is_heap_object() && stack[fi].reg[idx].is_heap_object() {
+                        let a = self.heap.read_string(stack[fi].reg[idx]).to_string();
+                        let b = self.heap.read_string(self.acc).to_string();
+                        let result = a + &b;
+                        self.acc = self.heap.alloc_string(&result);
+                    } else {
+                        self.acc =
+                            Value::from_smi(self.acc.as_smi() + stack[fi].reg[idx].as_smi())
+                    }
                 }
                 ByteCode::Sub => {
                     let idx = stack[fi].program.code[stack[fi].ip] as usize;
@@ -211,7 +227,7 @@ impl VM {
             }
         }
 
-        self.acc.as_smi()
+        self.acc
     }
 }
 
@@ -249,7 +265,7 @@ mod tests {
         };
 
         let mut vm = VM::new(Heap::new());
-        assert_eq!(vm.fde(&program), 830);
+        assert_eq!(vm.fde(&program).as_smi(),830);
     }
 
     #[test]
@@ -295,7 +311,7 @@ mod tests {
         };
 
         let mut vm = VM::new(Heap::new());
-        assert_eq!(vm.fde(&program), 30);
+        assert_eq!(vm.fde(&program).as_smi(),30);
     }
 
     #[test]
@@ -315,7 +331,7 @@ mod tests {
             symbols: HashMap::new(),
         };
         let mut vm = VM::new(Heap::new());
-        assert_eq!(vm.fde(&program), 1);
+        assert_eq!(vm.fde(&program).as_smi(),1);
     }
 
     #[test]
@@ -335,7 +351,7 @@ mod tests {
             symbols: HashMap::new(),
         };
         let mut vm = VM::new(Heap::new());
-        assert_eq!(vm.fde(&program), 0);
+        assert_eq!(vm.fde(&program).as_smi(),0);
     }
 
     #[test]
@@ -356,7 +372,7 @@ mod tests {
             symbols: HashMap::new(),
         };
         let mut vm = VM::new(Heap::new());
-        assert_eq!(vm.fde(&program), 1);
+        assert_eq!(vm.fde(&program).as_smi(),1);
     }
 
     #[test]
@@ -377,7 +393,7 @@ mod tests {
             symbols: HashMap::new(),
         };
         let mut vm = VM::new(Heap::new());
-        assert_eq!(vm.fde(&program), 1);
+        assert_eq!(vm.fde(&program).as_smi(),1);
     }
 
     #[test]
@@ -395,7 +411,7 @@ mod tests {
             symbols: HashMap::new(),
         };
         let mut vm = VM::new(Heap::new());
-        assert_eq!(vm.fde(&program), 1);
+        assert_eq!(vm.fde(&program).as_smi(),1);
     }
 
     #[test]
@@ -415,7 +431,7 @@ mod tests {
             symbols: HashMap::new(),
         };
         let mut vm = VM::new(Heap::new());
-        assert_eq!(vm.fde(&program), 1);
+        assert_eq!(vm.fde(&program).as_smi(),1);
     }
 
     #[test]
@@ -435,7 +451,7 @@ mod tests {
             symbols: HashMap::new(),
         };
         let mut vm = VM::new(Heap::new());
-        assert_eq!(vm.fde(&program), 1);
+        assert_eq!(vm.fde(&program).as_smi(),1);
     }
 
     #[test]
@@ -455,7 +471,7 @@ mod tests {
             symbols: HashMap::new(),
         };
         let mut vm = VM::new(Heap::new());
-        assert_eq!(vm.fde(&program), 0);
+        assert_eq!(vm.fde(&program).as_smi(),0);
     }
 
     #[test]
@@ -475,7 +491,7 @@ mod tests {
             symbols: HashMap::new(),
         };
         let mut vm = VM::new(Heap::new());
-        assert_eq!(vm.fde(&program), 99);
+        assert_eq!(vm.fde(&program).as_smi(),99);
     }
 
     #[test]
@@ -498,7 +514,7 @@ mod tests {
             symbols: HashMap::new(),
         };
         let mut vm = VM::new(heap);
-        assert_eq!(vm.fde(&program), 1);
+        assert_eq!(vm.fde(&program).as_smi(),1);
     }
 
     #[test]
@@ -521,7 +537,7 @@ mod tests {
             symbols: HashMap::new(),
         };
         let mut vm = VM::new(heap);
-        assert_eq!(vm.fde(&program), 0);
+        assert_eq!(vm.fde(&program).as_smi(),0);
     }
 
     #[test]
@@ -541,7 +557,7 @@ mod tests {
             symbols: HashMap::new(),
         };
         let mut vm = VM::new(Heap::new());
-        assert_eq!(vm.fde(&program), 7);
+        assert_eq!(vm.fde(&program).as_smi(),7);
     }
 
     #[test]
@@ -561,6 +577,31 @@ mod tests {
             symbols: HashMap::new(),
         };
         let mut vm = VM::new(Heap::new());
-        assert_eq!(vm.fde(&program), 5);
+        assert_eq!(vm.fde(&program).as_smi(),5);
+    }
+
+    #[test]
+    fn string_concatenation() {
+        let mut heap = Heap::new();
+        let a = heap.alloc_string("hello");
+        let b = heap.alloc_string(" world");
+        let program = Program {
+            code: vec![
+                ByteCode::LdaSmi as u8, 0,
+                ByteCode::Star as u8, 0,
+                ByteCode::LdaSmi as u8, 1,
+                ByteCode::Add as u8, 0,
+            ],
+            cons: vec![a, b],
+            funcs: vec![],
+            func_map: HashMap::new(),
+            param_count: 0,
+            next_reg: 0,
+            symbols: HashMap::new(),
+        };
+        let mut vm = VM::new(heap);
+        let result = vm.fde(&program);
+        assert!(result.is_heap_object());
+        assert_eq!(vm.format_value(result), "hello world");
     }
 }

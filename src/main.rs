@@ -27,7 +27,8 @@ fn main() {
     let mut heap = heap::Heap::new();
     let mut program = bytecode::Program::new();
     program.compile(&stmts, &mut heap);
-    let result = vm::VM::new(heap).fde(&program);
+    let mut vm = vm::VM::new(heap);
+    let result = vm.fde(&program);
 
-    println!("{}", result);
+    println!("{}", vm.format_value(result));
 }
