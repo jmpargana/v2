@@ -26,8 +26,9 @@ fn main() {
     let stmts = parser::Parser::new(tokens).parse();
     let mut heap = heap::Heap::new();
     let mut program = bytecode::Program::new();
+    let default_gc_threshold = 1024;
     program.compile(&stmts, &mut heap);
-    let mut vm = vm::VM::new(heap);
+    let mut vm = vm::VM::new(heap, default_gc_threshold);
     let result = vm.fde(&program);
 
     println!("{}", vm.format_value(result));

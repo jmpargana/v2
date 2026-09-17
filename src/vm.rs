@@ -3,17 +3,22 @@ use crate::{
     heap::Heap,
     value::Value,
 };
-use std::fmt;
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+};
 
 struct Frame<'a> {
     ip: usize,
     reg: [Value; 256],
+    cons: Vec<Value>,
     program: &'a Program,
 }
 
 pub struct VM {
     acc: Value,
     heap: Heap,
+    gc_threshold: usize,
 }
 
 impl fmt::Display for VM {
@@ -23,10 +28,11 @@ impl fmt::Display for VM {
 }
 
 impl VM {
-    pub fn new(heap: Heap) -> Self {
+    pub fn new(heap: Heap, gc_threshold: usize) -> Self {
         VM {
             acc: Default::default(),
             heap,
+            gc_threshold,
         }
     }
 
@@ -42,6 +48,7 @@ impl VM {
         let mut stack: Vec<Frame> = vec![Frame {
             ip: 0,
             reg: [Default::default(); 256],
+            cons: program.cons.clone(),
             program,
         }];
 
@@ -59,7 +66,7 @@ impl VM {
                 ByteCode::LdaSmi => {
                     let idx = stack[fi].program.code[stack[fi].ip] as usize;
                     stack[fi].ip += 1;
-                    self.acc = stack[fi].program.cons[idx];
+                    self.acc = stack[fi].cons[idx];
                 }
                 ByteCode::Star => {
                     let idx = stack[fi].program.code[stack[fi].ip] as usize;
@@ -79,9 +86,12 @@ impl VM {
                         let b = self.heap.read_string(self.acc).to_string();
                         let result = a + &b;
                         self.acc = self.heap.alloc_string(&result);
+
+                        if self.heap.is_over_threshold(self.gc_threshold) {
+                            self.collect_garbage(&mut stack);
+                        }
                     } else {
-                        self.acc =
-                            Value::from_smi(self.acc.as_smi() + stack[fi].reg[idx].as_smi())
+                        self.acc = Value::from_smi(self.acc.as_smi() + stack[fi].reg[idx].as_smi())
                     }
                 }
                 ByteCode::Sub => {
@@ -113,6 +123,7 @@ impl VM {
                     stack.push(Frame {
                         ip: 0,
                         reg: regs,
+                        cons: function.cons.clone(),
                         program: function,
                     });
                 }
@@ -229,6 +240,46 @@ impl VM {
 
         self.acc
     }
+
+    fn collect_garbage(&mut self, stack: &mut Vec<Frame>) {
+        let mut live = HashSet::new();
+
+        if self.acc.is_heap_object() {
+            live.insert(self.acc.heap_offset());
+        }
+        for frame in stack.iter() {
+            for val in frame.reg.iter() {
+                if val.is_heap_object() {
+                    live.insert(val.heap_offset());
+                }
+            }
+            for val in frame.cons.iter() {
+                if val.is_heap_object() {
+                    live.insert(val.heap_offset());
+                }
+            }
+        }
+
+        let remap = self.heap.collect(&live);
+
+        Self::remap_value(&mut self.acc, &remap);
+        for frame in stack.iter_mut() {
+            for val in frame.reg.iter_mut() {
+                Self::remap_value(val, &remap);
+            }
+            for val in frame.cons.iter_mut() {
+                Self::remap_value(val, &remap);
+            }
+        }
+    }
+
+    fn remap_value(val: &mut Value, remap: &HashMap<usize, usize>) {
+        if val.is_heap_object() {
+            if let Some(&new_offset) = remap.get(&val.heap_offset()) {
+                *val = Value::from_heap(new_offset);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -256,7 +307,11 @@ mod tests {
                 ByteCode::Add as u8,
                 0,
             ],
-            cons: vec![Value::from_smi(30), Value::from_smi(20), Value::from_smi(40)],
+            cons: vec![
+                Value::from_smi(30),
+                Value::from_smi(20),
+                Value::from_smi(40),
+            ],
             funcs: vec![],
             func_map: HashMap::new(),
             param_count: 0,
@@ -264,8 +319,8 @@ mod tests {
             symbols: HashMap::new(),
         };
 
-        let mut vm = VM::new(Heap::new());
-        assert_eq!(vm.fde(&program).as_smi(),830);
+        let mut vm = VM::new(Heap::new(), 1024);
+        assert_eq!(vm.fde(&program).as_smi(), 830);
     }
 
     #[test]
@@ -310,18 +365,22 @@ mod tests {
             symbols: HashMap::new(),
         };
 
-        let mut vm = VM::new(Heap::new());
-        assert_eq!(vm.fde(&program).as_smi(),30);
+        let mut vm = VM::new(Heap::new(), 1024);
+        assert_eq!(vm.fde(&program).as_smi(), 30);
     }
 
     #[test]
     fn test_equal_true() {
         let program = Program {
             code: vec![
-                ByteCode::LdaSmi as u8, 0,
-                ByteCode::Star as u8, 0,
-                ByteCode::LdaSmi as u8, 0,
-                ByteCode::TestEqual as u8, 0,
+                ByteCode::LdaSmi as u8,
+                0,
+                ByteCode::Star as u8,
+                0,
+                ByteCode::LdaSmi as u8,
+                0,
+                ByteCode::TestEqual as u8,
+                0,
             ],
             cons: vec![Value::from_smi(42)],
             funcs: vec![],
@@ -330,18 +389,22 @@ mod tests {
             next_reg: 0,
             symbols: HashMap::new(),
         };
-        let mut vm = VM::new(Heap::new());
-        assert_eq!(vm.fde(&program).as_smi(),1);
+        let mut vm = VM::new(Heap::new(), 1024);
+        assert_eq!(vm.fde(&program).as_smi(), 1);
     }
 
     #[test]
     fn test_equal_false() {
         let program = Program {
             code: vec![
-                ByteCode::LdaSmi as u8, 0,
-                ByteCode::Star as u8, 0,
-                ByteCode::LdaSmi as u8, 1,
-                ByteCode::TestEqual as u8, 0,
+                ByteCode::LdaSmi as u8,
+                0,
+                ByteCode::Star as u8,
+                0,
+                ByteCode::LdaSmi as u8,
+                1,
+                ByteCode::TestEqual as u8,
+                0,
             ],
             cons: vec![Value::from_smi(1), Value::from_smi(2)],
             funcs: vec![],
@@ -350,8 +413,8 @@ mod tests {
             next_reg: 0,
             symbols: HashMap::new(),
         };
-        let mut vm = VM::new(Heap::new());
-        assert_eq!(vm.fde(&program).as_smi(),0);
+        let mut vm = VM::new(Heap::new(), 1024);
+        assert_eq!(vm.fde(&program).as_smi(), 0);
     }
 
     #[test]
@@ -359,10 +422,14 @@ mod tests {
         // reg[0] = 5, acc = 10 → acc > reg[0] → TestLess yields 1
         let program = Program {
             code: vec![
-                ByteCode::LdaSmi as u8, 0,
-                ByteCode::Star as u8, 0,
-                ByteCode::LdaSmi as u8, 1,
-                ByteCode::TestLess as u8, 0,
+                ByteCode::LdaSmi as u8,
+                0,
+                ByteCode::Star as u8,
+                0,
+                ByteCode::LdaSmi as u8,
+                1,
+                ByteCode::TestLess as u8,
+                0,
             ],
             cons: vec![Value::from_smi(5), Value::from_smi(10)],
             funcs: vec![],
@@ -371,8 +438,8 @@ mod tests {
             next_reg: 0,
             symbols: HashMap::new(),
         };
-        let mut vm = VM::new(Heap::new());
-        assert_eq!(vm.fde(&program).as_smi(),1);
+        let mut vm = VM::new(Heap::new(), 1024);
+        assert_eq!(vm.fde(&program).as_smi(), 1);
     }
 
     #[test]
@@ -380,10 +447,14 @@ mod tests {
         // reg[0] = 10, acc = 5 → acc < reg[0] → TestGreater yields 1
         let program = Program {
             code: vec![
-                ByteCode::LdaSmi as u8, 0,
-                ByteCode::Star as u8, 0,
-                ByteCode::LdaSmi as u8, 1,
-                ByteCode::TestGreater as u8, 0,
+                ByteCode::LdaSmi as u8,
+                0,
+                ByteCode::Star as u8,
+                0,
+                ByteCode::LdaSmi as u8,
+                1,
+                ByteCode::TestGreater as u8,
+                0,
             ],
             cons: vec![Value::from_smi(10), Value::from_smi(5)],
             funcs: vec![],
@@ -392,17 +463,14 @@ mod tests {
             next_reg: 0,
             symbols: HashMap::new(),
         };
-        let mut vm = VM::new(Heap::new());
-        assert_eq!(vm.fde(&program).as_smi(),1);
+        let mut vm = VM::new(Heap::new(), 1024);
+        assert_eq!(vm.fde(&program).as_smi(), 1);
     }
 
     #[test]
     fn test_logical_not() {
         let program = Program {
-            code: vec![
-                ByteCode::LdaSmi as u8, 0,
-                ByteCode::LogicalNot as u8,
-            ],
+            code: vec![ByteCode::LdaSmi as u8, 0, ByteCode::LogicalNot as u8],
             cons: vec![Value::from_smi(0)],
             funcs: vec![],
             func_map: HashMap::new(),
@@ -410,18 +478,22 @@ mod tests {
             next_reg: 0,
             symbols: HashMap::new(),
         };
-        let mut vm = VM::new(Heap::new());
-        assert_eq!(vm.fde(&program).as_smi(),1);
+        let mut vm = VM::new(Heap::new(), 1024);
+        assert_eq!(vm.fde(&program).as_smi(), 1);
     }
 
     #[test]
     fn test_logical_and() {
         let program = Program {
             code: vec![
-                ByteCode::LdaSmi as u8, 0,
-                ByteCode::Star as u8, 0,
-                ByteCode::LdaSmi as u8, 0,
-                ByteCode::LogicalAnd as u8, 0,
+                ByteCode::LdaSmi as u8,
+                0,
+                ByteCode::Star as u8,
+                0,
+                ByteCode::LdaSmi as u8,
+                0,
+                ByteCode::LogicalAnd as u8,
+                0,
             ],
             cons: vec![Value::from_smi(1)],
             funcs: vec![],
@@ -430,18 +502,22 @@ mod tests {
             next_reg: 0,
             symbols: HashMap::new(),
         };
-        let mut vm = VM::new(Heap::new());
-        assert_eq!(vm.fde(&program).as_smi(),1);
+        let mut vm = VM::new(Heap::new(), 1024);
+        assert_eq!(vm.fde(&program).as_smi(), 1);
     }
 
     #[test]
     fn test_logical_or() {
         let program = Program {
             code: vec![
-                ByteCode::LdaSmi as u8, 0,
-                ByteCode::Star as u8, 0,
-                ByteCode::LdaSmi as u8, 1,
-                ByteCode::LogicalOr as u8, 0,
+                ByteCode::LdaSmi as u8,
+                0,
+                ByteCode::Star as u8,
+                0,
+                ByteCode::LdaSmi as u8,
+                1,
+                ByteCode::LogicalOr as u8,
+                0,
             ],
             cons: vec![Value::from_smi(1), Value::from_smi(0)],
             funcs: vec![],
@@ -450,8 +526,8 @@ mod tests {
             next_reg: 0,
             symbols: HashMap::new(),
         };
-        let mut vm = VM::new(Heap::new());
-        assert_eq!(vm.fde(&program).as_smi(),1);
+        let mut vm = VM::new(Heap::new(), 1024);
+        assert_eq!(vm.fde(&program).as_smi(), 1);
     }
 
     #[test]
@@ -459,9 +535,12 @@ mod tests {
         // acc = 0 → JumpIfFalse skips over LdaSmi(99) → acc stays 0
         let program = Program {
             code: vec![
-                ByteCode::LdaSmi as u8, 0,
-                ByteCode::JumpIfFalse as u8, 2,
-                ByteCode::LdaSmi as u8, 1,
+                ByteCode::LdaSmi as u8,
+                0,
+                ByteCode::JumpIfFalse as u8,
+                2,
+                ByteCode::LdaSmi as u8,
+                1,
             ],
             cons: vec![Value::from_smi(0), Value::from_smi(99)],
             funcs: vec![],
@@ -470,8 +549,8 @@ mod tests {
             next_reg: 0,
             symbols: HashMap::new(),
         };
-        let mut vm = VM::new(Heap::new());
-        assert_eq!(vm.fde(&program).as_smi(),0);
+        let mut vm = VM::new(Heap::new(), 1024);
+        assert_eq!(vm.fde(&program).as_smi(), 0);
     }
 
     #[test]
@@ -479,9 +558,12 @@ mod tests {
         // acc = 1 → JumpIfFalse not taken → LdaSmi loads 99
         let program = Program {
             code: vec![
-                ByteCode::LdaSmi as u8, 0,
-                ByteCode::JumpIfFalse as u8, 2,
-                ByteCode::LdaSmi as u8, 1,
+                ByteCode::LdaSmi as u8,
+                0,
+                ByteCode::JumpIfFalse as u8,
+                2,
+                ByteCode::LdaSmi as u8,
+                1,
             ],
             cons: vec![Value::from_smi(1), Value::from_smi(99)],
             funcs: vec![],
@@ -490,8 +572,8 @@ mod tests {
             next_reg: 0,
             symbols: HashMap::new(),
         };
-        let mut vm = VM::new(Heap::new());
-        assert_eq!(vm.fde(&program).as_smi(),99);
+        let mut vm = VM::new(Heap::new(), 1024);
+        assert_eq!(vm.fde(&program).as_smi(), 99);
     }
 
     #[test]
@@ -501,10 +583,14 @@ mod tests {
         let b = heap.alloc_string("hello");
         let program = Program {
             code: vec![
-                ByteCode::LdaSmi as u8, 0,
-                ByteCode::Star as u8, 0,
-                ByteCode::LdaSmi as u8, 1,
-                ByteCode::TestEqual as u8, 0,
+                ByteCode::LdaSmi as u8,
+                0,
+                ByteCode::Star as u8,
+                0,
+                ByteCode::LdaSmi as u8,
+                1,
+                ByteCode::TestEqual as u8,
+                0,
             ],
             cons: vec![a, b],
             funcs: vec![],
@@ -513,8 +599,8 @@ mod tests {
             next_reg: 0,
             symbols: HashMap::new(),
         };
-        let mut vm = VM::new(heap);
-        assert_eq!(vm.fde(&program).as_smi(),1);
+        let mut vm = VM::new(heap, 1024);
+        assert_eq!(vm.fde(&program).as_smi(), 1);
     }
 
     #[test]
@@ -524,10 +610,14 @@ mod tests {
         let b = heap.alloc_string("world");
         let program = Program {
             code: vec![
-                ByteCode::LdaSmi as u8, 0,
-                ByteCode::Star as u8, 0,
-                ByteCode::LdaSmi as u8, 1,
-                ByteCode::TestEqual as u8, 0,
+                ByteCode::LdaSmi as u8,
+                0,
+                ByteCode::Star as u8,
+                0,
+                ByteCode::LdaSmi as u8,
+                1,
+                ByteCode::TestEqual as u8,
+                0,
             ],
             cons: vec![a, b],
             funcs: vec![],
@@ -536,18 +626,22 @@ mod tests {
             next_reg: 0,
             symbols: HashMap::new(),
         };
-        let mut vm = VM::new(heap);
-        assert_eq!(vm.fde(&program).as_smi(),0);
+        let mut vm = VM::new(heap, 1024);
+        assert_eq!(vm.fde(&program).as_smi(), 0);
     }
 
     #[test]
     fn subtraction() {
         let program = Program {
             code: vec![
-                ByteCode::LdaSmi as u8, 0,
-                ByteCode::Star as u8, 0,
-                ByteCode::LdaSmi as u8, 1,
-                ByteCode::Sub as u8, 0,
+                ByteCode::LdaSmi as u8,
+                0,
+                ByteCode::Star as u8,
+                0,
+                ByteCode::LdaSmi as u8,
+                1,
+                ByteCode::Sub as u8,
+                0,
             ],
             cons: vec![Value::from_smi(10), Value::from_smi(3)],
             funcs: vec![],
@@ -556,18 +650,22 @@ mod tests {
             next_reg: 0,
             symbols: HashMap::new(),
         };
-        let mut vm = VM::new(Heap::new());
-        assert_eq!(vm.fde(&program).as_smi(),7);
+        let mut vm = VM::new(Heap::new(), 1024);
+        assert_eq!(vm.fde(&program).as_smi(), 7);
     }
 
     #[test]
     fn division() {
         let program = Program {
             code: vec![
-                ByteCode::LdaSmi as u8, 0,
-                ByteCode::Star as u8, 0,
-                ByteCode::LdaSmi as u8, 1,
-                ByteCode::Div as u8, 0,
+                ByteCode::LdaSmi as u8,
+                0,
+                ByteCode::Star as u8,
+                0,
+                ByteCode::LdaSmi as u8,
+                1,
+                ByteCode::Div as u8,
+                0,
             ],
             cons: vec![Value::from_smi(20), Value::from_smi(4)],
             funcs: vec![],
@@ -576,8 +674,8 @@ mod tests {
             next_reg: 0,
             symbols: HashMap::new(),
         };
-        let mut vm = VM::new(Heap::new());
-        assert_eq!(vm.fde(&program).as_smi(),5);
+        let mut vm = VM::new(Heap::new(), 1024);
+        assert_eq!(vm.fde(&program).as_smi(), 5);
     }
 
     #[test]
@@ -587,10 +685,14 @@ mod tests {
         let b = heap.alloc_string(" world");
         let program = Program {
             code: vec![
-                ByteCode::LdaSmi as u8, 0,
-                ByteCode::Star as u8, 0,
-                ByteCode::LdaSmi as u8, 1,
-                ByteCode::Add as u8, 0,
+                ByteCode::LdaSmi as u8,
+                0,
+                ByteCode::Star as u8,
+                0,
+                ByteCode::LdaSmi as u8,
+                1,
+                ByteCode::Add as u8,
+                0,
             ],
             cons: vec![a, b],
             funcs: vec![],
@@ -599,9 +701,49 @@ mod tests {
             next_reg: 0,
             symbols: HashMap::new(),
         };
-        let mut vm = VM::new(heap);
+        let mut vm = VM::new(heap, 1024);
         let result = vm.fde(&program);
         assert!(result.is_heap_object());
         assert_eq!(vm.format_value(result), "hello world");
+    }
+
+    #[test]
+    fn garbage_collection() {
+        let mut heap = Heap::new();
+        let a = heap.alloc_string("a"); // 6 bytes (1 type + 4 len + 1 char)
+        let b = heap.alloc_string("b"); // 6 bytes -> heap total: 12
+
+        // Concatenate "a"+"b" = "ab" (7 bytes, heap → 19)
+        // Store "ab" in r0, then overwrite r0 with "a" — first "ab" is now dead
+        // Concatenate again "a"+"b" = "ab" (7 bytes, heap → 26, triggers GC)
+        // GC should collect the dead "ab", compacting heap to 19
+        let program = Program {
+            code: vec![
+                ByteCode::LdaSmi as u8, 0, // acc = "a"
+                ByteCode::Star as u8, 0,    // r0 = "a"
+                ByteCode::LdaSmi as u8, 1,  // acc = "b"
+                ByteCode::Add as u8, 0,     // acc = "a" + "b" = "ab" (alloc, heap 19)
+                ByteCode::Star as u8, 0,    // r0 = "ab"
+                ByteCode::LdaSmi as u8, 0,  // acc = "a"
+                ByteCode::Star as u8, 0,    // r0 = "a" (first "ab" now unreachable)
+                ByteCode::LdaSmi as u8, 1,  // acc = "b"
+                ByteCode::Add as u8, 0,     // acc = "a" + "b" = "ab" (alloc, heap 26 → GC)
+            ],
+            cons: vec![a, b],
+            funcs: vec![],
+            func_map: HashMap::new(),
+            param_count: 0,
+            next_reg: 1,
+            symbols: HashMap::new(),
+        };
+
+        let mut vm = VM::new(heap, 25);
+        let result = vm.fde(&program);
+
+        assert!(result.is_heap_object());
+        assert_eq!(vm.format_value(result), "ab");
+        // 12 (constants "a","b") + 7 (surviving "ab") = 19
+        // without GC it would be 26
+        assert_eq!(vm.heap.len(), 19);
     }
 }
