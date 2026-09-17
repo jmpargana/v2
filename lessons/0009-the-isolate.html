@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Lesson 9: The Isolate</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<h1>The Isolate</h1>
+<p class="lesson-meta">Lesson 9 &middot; ~25 min &middot; Prerequisite: <a href="0008-garbage-collection.html">Lesson 8</a></p>
+
+<p>
+  You have all the pieces: a register VM with an accumulator, a heap with tagged values,
+  and a mark-compact garbage collector. This lesson assembles them into an
+  <strong>Isolate</strong> &mdash; a self-contained execution context with its own memory,
+  its own GC, and no shared state with any other Isolate.
+</p>
+<p>
+  This is the core abstraction of V8. Every Chrome tab, every Node.js worker, every
+  Cloudflare Worker runs inside an Isolate. They share a process but nothing else.
+</p>
+
+<h2>What Is an Isolate?</h2>
+
+<p>An Isolate is everything needed to run a program, bundled into one struct:</p>
+
+<pre><code>pub struct Isolate {
+    acc: Value,                 // accumulator
+    heap: Heap,                 // object storage + GC
+    gc_threshold: usize,        // collection policy
+}</code></pre>
+
+<p>
+  That&rsquo;s it. Your current VM struct <em>is</em> an Isolate &mdash; it already owns the
+  heap and execution state. The lesson is about what this means when you have
+  <strong>more than one</strong>.
+</p>
+
+<h2>One Process, Many Worlds</h2>
+
+<p>
+  Two Isolates in the same process see completely separate realities:
+</p>
+
+<pre><code>let mut iso_a = Isolate::new();
+let mut iso_b = Isolate::new();
+
+iso_a.eval("let name = \"alice\";");
+iso_b.eval("let name = \"bob\";");
+
+// iso_a.heap: offset 0 → "alice"
+// iso_b.heap: offset 0 → "bob"
+//
+// Same heap offset, different bytes.
+// No shared mutable state. No locks. No coordination.</code></pre>
+
+<p>
+  Each Isolate has its own:
+</p>
+
+<ul>
+  <li>Heap (its own <code>Vec&lt;u8&gt;</code>)</li>
+  <li>Accumulator and execution state</li>
+  <li>GC (operates only on its own heap)</li>
+  <li>Constant pools</li>
+</ul>
+
+<p>
+  A tagged value with bit&nbsp;0&nbsp;=&nbsp;1 means &ldquo;heap offset X <em>in my heap</em>.&rdquo;
+  Passing that value to another Isolate is meaningless &mdash; it would index into a
+  different byte array and read garbage. This isn&rsquo;t a bug; it&rsquo;s the
+  <strong>isolation guarantee</strong>.
+</p>
+
+<div class="quiz" data-correct="2"
+     data-right="Correct! Each Isolate has its own heap. A heap pointer is an offset into one specific Vec<u8>. In the other Isolate's heap, that offset could be a different object, or past the end of the array entirely."
+     data-wrong="Think about what a tagged heap pointer actually contains — it's an offset. An offset into which byte array? Each Isolate has its own.">
+  <div class="quiz-question">
+    Isolate A stores a string at heap offset 0. You copy that tagged Value
+    to Isolate B. What happens when B tries to read it?
+  </div>
+  <div class="quiz-options">
+    <div class="quiz-option">B reads the same string &mdash; heap offset 0 is universal</div>
+    <div class="quiz-option">B gets an error &mdash; Isolates reject foreign Values</div>
+    <div class="quiz-option">B reads whatever is at offset 0 in its own heap &mdash; likely wrong data or a crash</div>
+    <div class="quiz-option">The GC automatically copies the string to B&rsquo;s heap</div>
+  </div>
+  <div class="quiz-feedback"></div>
+</div>
+
+<h2>The Lifecycle</h2>
+
+<p>In V8, an Isolate&rsquo;s lifecycle is:</p>
+
+<ol>
+  <li><strong>Create:</strong> allocate the heap, initialize state</li>
+  <li><strong>Compile:</strong> parse source &rarr; emit bytecode, allocating string constants on this Isolate&rsquo;s heap</li>
+  <li><strong>Execute:</strong> run the bytecode, allocating runtime objects on this Isolate&rsquo;s heap</li>
+  <li><strong>Read result:</strong> extract the final value</li>
+  <li><strong>Dispose:</strong> drop the entire Isolate &mdash; heap and all &mdash; in one shot</li>
+</ol>
+
+<p>
+  Step 5 is where Rust shines. When the Isolate is dropped, it owns its <code>Heap</code>,
+  which owns its <code>Vec&lt;u8&gt;</code>. Rust drops the whole thing automatically.
+  No leak, no dangling pointers, no GC needed for the Isolate itself.
+</p>
+
+<pre><code>{
+    let mut iso = Isolate::new();
+    iso.eval("let x = \"hello\" + \" world\";");
+} // iso dropped here — heap, constants, everything freed</code></pre>
+
+<h2>Design: What the Isolate Owns</h2>
+
+<p>
+  The Isolate wraps compilation <em>and</em> execution. Source code goes in,
+  a result comes out. The caller never touches the heap or bytecode directly:
+</p>
+
+<pre><code>pub struct Isolate {
+    acc: Value,
+    heap: Heap,
+    gc_threshold: usize,
+}
+
+impl Isolate {
+    pub fn new() -> Self {
+        Isolate {
+            acc: Value::default(),
+            heap: Heap::new(),
+            gc_threshold: 1024,
+        }
+    }
+
+    pub fn eval(&amp;mut self, source: &amp;str) -> IsolateResult {
+        let tokens = Lexer::lex(source);
+        let stmts = Parser::new(tokens).parse();
+        let mut program = Program::new();
+        program.compile(&amp;stmts, &amp;mut self.heap);
+        self.run(&amp;program)
+    }
+
+    fn run(&amp;mut self, program: &amp;Program) -> IsolateResult {
+        // your current fde logic, using self.heap, self.acc
+        // ...
+    }
+
+    pub fn format_result(&amp;self) -> String {
+        // format self.acc using self.heap
+    }
+}</code></pre>
+
+<p>
+  The key design principle: <strong>the Isolate is the boundary</strong>.
+  Nothing goes in except source code (a <code>&amp;str</code>).
+  Nothing comes out except a formatted result or a copied primitive.
+  Heap pointers never escape.
+</p>
+
+<div class="callout">
+  <strong>V8 comparison:</strong> V8&rsquo;s <code>Isolate::New()</code> creates a new Isolate.
+  <code>v8::Script::Compile()</code> compiles source within an Isolate&rsquo;s context.
+  <code>script-&gt;Run()</code> executes it. Results are <code>v8::Local&lt;v8::Value&gt;</code>
+  handles that are scoped to the Isolate &mdash; you must copy data out (e.g., convert a
+  V8 string to a C++ <code>std::string</code>) before the Isolate can be disposed.
+  Your <code>format_result</code> serves the same purpose.
+</div>
+
+<h2>Thread Safety</h2>
+
+<p>
+  In V8, a single Isolate is <strong>single-threaded</strong>. You can have many Isolates
+  in one process (on different threads), but each Isolate is only accessed by one thread
+  at a time. V8 has a <code>Locker</code> API to enforce this.
+</p>
+<p>
+  In Rust, this falls out naturally. Your <code>Isolate</code> takes <code>&amp;mut self</code>
+  for <code>eval</code>, which means only one caller can use it at a time. If you put
+  Isolates in separate threads, each thread owns its Isolate &mdash; no <code>Arc</code>,
+  no <code>Mutex</code>, no synchronization needed.
+</p>
+
+<pre><code>use std::thread;
+
+let handle_a = thread::spawn(|| {
+    let mut iso = Isolate::new();
+    iso.eval("let x = 1 + 2;")
+});
+
+let handle_b = thread::spawn(|| {
+    let mut iso = Isolate::new();
+    iso.eval("let x = 3 + 4;")
+});
+
+// Two threads, two Isolates, zero shared state.</code></pre>
+
+<div class="quiz" data-correct="1"
+     data-right="Correct! Isolates don't share heaps, so their GCs are completely independent. Isolate A's GC only scans A's roots and compacts A's heap. B is unaffected."
+     data-wrong="Think about what the GC needs — roots and a heap. Each Isolate has its own. There's nothing shared for the GC to coordinate on.">
+  <div class="quiz-question">
+    If Isolate A triggers garbage collection, what happens to Isolate B?
+  </div>
+  <div class="quiz-options">
+    <div class="quiz-option">B pauses until A&rsquo;s GC finishes (stop-the-world is global)</div>
+    <div class="quiz-option">Nothing &mdash; A&rsquo;s GC only touches A&rsquo;s heap and roots</div>
+    <div class="quiz-option">B&rsquo;s heap is also compacted to stay in sync</div>
+    <div class="quiz-option">B receives A&rsquo;s remap to update any shared pointers</div>
+  </div>
+  <div class="quiz-feedback"></div>
+</div>
+
+<h2>Implementation</h2>
+
+<h3>Step 1: Rename and refactor</h3>
+
+<p>
+  Your current <code>VM</code> struct already <em>is</em> an Isolate &mdash; it owns the heap,
+  the accumulator, and the GC threshold. Rename it:
+</p>
+
+<pre><code>// vm.rs → isolate.rs (or just rename the struct)
+pub struct Isolate {
+    acc: Value,
+    heap: Heap,
+    gc_threshold: usize,
+}</code></pre>
+
+<h3>Step 2: Add <code>eval</code></h3>
+
+<p>
+  Move the lex &rarr; parse &rarr; compile &rarr; run pipeline into the Isolate.
+  The Isolate&rsquo;s heap is used during compilation (for string constants) and
+  during execution (for runtime allocations):
+</p>
+
+<pre><code>pub fn eval(&amp;mut self, source: &amp;str) -> Value {
+    let tokens = Lexer::lex(source);
+    let stmts = Parser::new(tokens).parse();
+    let mut program = Program::new();
+    program.compile(&amp;stmts, &amp;mut self.heap);
+    self.run(&amp;program)
+}
+
+fn run(&amp;mut self, program: &amp;Program) -> Value {
+    // your existing fde() body, moved here
+}</code></pre>
+
+<h3>Step 3: Add <code>read_result</code></h3>
+
+<p>
+  The result needs to be extracted <em>before</em> the Isolate is dropped, because heap
+  pointers are meaningless outside:
+</p>
+
+<pre><code>pub fn read_result(&amp;self) -> String {
+    if self.acc.is_smi() {
+        self.acc.as_smi().to_string()
+    } else {
+        self.heap.read_string(self.acc).to_string()
+    }
+}</code></pre>
+
+<h3>Step 4: Update <code>main.rs</code></h3>
+
+<pre><code>fn main() {
+    let src = fs::read_to_string(&amp;args[1]).unwrap();
+    let mut isolate = Isolate::new();
+    isolate.eval(&amp;src);
+    println!("{}", isolate.read_result());
+}</code></pre>
+
+<h3>Step 5: Multi-Isolate test</h3>
+
+<p>This is the payoff &mdash; prove that two Isolates are independent:</p>
+
+<pre><code>#[test]
+fn two_isolates_are_independent() {
+    let mut iso_a = Isolate::new();
+    let mut iso_b = Isolate::new();
+
+    iso_a.eval("let x = 10 + 20;");
+    iso_b.eval("let x = 99;");
+
+    assert_eq!(iso_a.read_result(), "30");
+    assert_eq!(iso_b.read_result(), "99");
+}
+
+#[test]
+fn isolate_string_isolation() {
+    let mut iso_a = Isolate::new();
+    let mut iso_b = Isolate::new();
+
+    iso_a.eval("let s = \"hello\";");
+    iso_b.eval("let s = \"world\";");
+
+    assert_eq!(iso_a.read_result(), "hello");
+    assert_eq!(iso_b.read_result(), "world");
+    // Both heaps have a string at offset 0, but different content.
+}</code></pre>
+
+<h2>What Comes Next</h2>
+
+<p>
+  You now have a working Isolate &mdash; an independent execution context with its own
+  heap, GC, and bytecode execution. This is the foundation that everything else builds on:
+</p>
+
+<ul>
+  <li><strong>Contexts:</strong> V8 supports multiple Contexts within one Isolate (separate
+      global objects sharing the same heap). This is how Chrome runs multiple iframes in
+      one Isolate.</li>
+  <li><strong>Builtins:</strong> Each Isolate has built-in functions (<code>console.log</code>,
+      <code>Math.floor</code>). These are native functions registered on the Isolate.</li>
+  <li><strong>Loops:</strong> <code>while</code> and <code>for</code> loops &mdash; same
+      backpatching technique as <code>if/else</code>, but jumping backwards.</li>
+  <li><strong>Objects and Maps:</strong> Heap-allocated objects with named properties &mdash;
+      the next major heap type after strings.</li>
+</ul>
+
+<div class="callout">
+  <strong>Primary source:</strong> The V8 embedding guide covers the Isolate API from the
+  embedder&rsquo;s perspective &mdash; how Chrome and Node.js create and manage Isolates.
+  For the internal structure, see <code>src/execution/isolate.h</code> in the V8 source &mdash;
+  the <code>Isolate</code> class owns the heap, the builtins table, the thread-local state,
+  and the GC. Your struct is a distilled version of that 5000-line class.
+</div>
+
+<p>
+  Questions about the Isolate boundary, how to handle results, or how this maps to V8?
+  Ask your teacher.
+</p>
+
+<nav class="lesson-nav">
+  <a href="0008-garbage-collection.html">&larr; Lesson 8: Garbage Collection</a>
+  <a href="../reference/bytecode-instruction-set.html">Reference &rarr;</a>
+</nav>
+
+<footer>g8 teaching workspace</footer>
+
+<script src="../assets/quiz.js"></script>
+</body>
+</html>
