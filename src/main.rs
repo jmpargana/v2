@@ -13,7 +13,7 @@ use std::process;
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: g8 <file.js>");
+        eprintln!("usage: v2 <file.js>");
         process::exit(1);
     }
 
