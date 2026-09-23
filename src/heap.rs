@@ -1,41 +1,35 @@
-use std::collections::{HashMap, HashSet};
-
 use crate::value::Value;
 
-pub struct Heap {
-    objects: Vec<Option<HeapObject>>,
-}
-
+#[derive(Debug)]
 pub enum HeapObject {
     String(HeapString),
     Function(BytecodeFunction),
     Closure(HeapClosure),
 }
 
+#[derive(Debug)]
 pub struct HeapString {
     pub data: String,
 }
 
+#[derive(Debug)]
 pub struct HeapClosure {
     pub function: Value,
-    // TODO: implement later the open and closed
     pub upvalues: Vec<Value>,
 }
 
+#[derive(Debug)]
 pub struct BytecodeFunction {
     pub code: Vec<u8>,
     pub cons: Vec<Value>,
     pub param_count: usize,
-    // Why?
     pub reg_count: usize,
 }
 
-#[repr(u8)]
-pub enum InstanceType {
-    String = 1,
+pub struct Heap {
+    objects: Vec<Option<HeapObject>>,
 }
 
-// TODO: abstract write and read value without hardcoded function.
 impl Heap {
     pub fn new() -> Self {
         Self {
@@ -51,6 +45,12 @@ impl Heap {
         let idx = self.objects.len();
         self.objects.push(Some(obj));
         Value::from_heap(idx)
+    }
+
+    pub fn alloc_string(&mut self, s: &str) -> Value {
+        self.alloc(HeapObject::String(HeapString {
+            data: s.to_string(),
+        }))
     }
 
     pub fn read_string(&self, val: Value) -> &str {
@@ -74,14 +74,11 @@ impl Heap {
         }
     }
 
-    // Mark + Compact
     pub fn collect(&mut self, roots: &[Value]) {
-        let mut marked = [false; self.objects.len()];
-
+        let mut marked = vec![false; self.objects.len()];
         for &root in roots {
             self.mark(&mut marked, root);
         }
-
         for i in 0..self.objects.len() {
             if !marked[i] {
                 self.objects[i] = None;
@@ -94,19 +91,15 @@ impl Heap {
             return;
         }
         let idx = val.heap_offset();
-
         if idx >= self.objects.len() || marked[idx] {
             return;
         }
-
         marked[idx] = true;
 
         match &self.objects[idx] {
-            Some(HeapObject::String(_)) => {
-                // nothing to be done
-            }
-            Some(HeapObject::Function(c)) => {
-                for &v in &c.cons {
+            Some(HeapObject::String(_)) => {}
+            Some(HeapObject::Function(f)) => {
+                for &v in &f.cons {
                     self.mark(marked, v);
                 }
             }
@@ -116,7 +109,15 @@ impl Heap {
                     self.mark(marked, v);
                 }
             }
-            None => todo!(),
+            None => {}
         }
+    }
+
+    pub fn is_over_threshold(&self, threshold: usize) -> bool {
+        self.objects.len() >= threshold
+    }
+
+    pub fn len(&self) -> usize {
+        self.objects.len()
     }
 }

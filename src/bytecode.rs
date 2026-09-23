@@ -113,26 +113,26 @@ impl Compiler {
         val
     }
 
-    pub fn compile(&mut self, stmts: &[Stmt], heap: &mut Heap) -> Value {
+    pub fn compile_stmts(&mut self, stmts: &[Stmt], heap: &mut Heap) {
         for stmt in stmts {
             self.compile_stmt(stmt, heap);
         }
+    }
 
+    pub fn finalize(mut self, heap: &mut Heap) -> Value {
         let func = heap.alloc(HeapObject::Function(BytecodeFunction {
             code: std::mem::take(&mut self.code),
             cons: std::mem::take(&mut self.cons),
             param_count: self.param_count,
             reg_count: self.next_reg,
         }));
-
         heap.alloc(HeapObject::Closure(HeapClosure {
             function: func,
             upvalues: vec![],
         }))
     }
 
-    // TODO: refactor to return
-    pub fn compile_stmt(&mut self, stmt: &Stmt, heap: &mut Heap) {
+    fn compile_stmt(&mut self, stmt: &Stmt, heap: &mut Heap) {
         match stmt {
             Stmt::VarDecl { name, value, .. } => {
                 self.compile_expr(value, heap);
@@ -144,17 +144,15 @@ impl Compiler {
             Stmt::FuncDecl { name, params, body } => {
                 let mut child = Compiler::init();
                 child.param_count = params.len();
-
                 for param in params {
                     let reg = child.alloc_reg();
                     child.symbols.insert(param.clone(), reg);
                 }
-
-                let closure = child.compile(body, heap);
+                child.compile_stmts(body, heap);
+                let closure_val = child.finalize(heap);
 
                 let cons_idx = self.cons.len();
-                self.cons.push(closure);
-
+                self.cons.push(closure_val);
                 self.code.push(ByteCode::LdaSmi as u8);
                 self.code.push(cons_idx as u8);
                 let reg = self.alloc_reg();
@@ -176,12 +174,11 @@ impl Compiler {
             } => {
                 self.compile_expr(condition, heap);
                 let jump_false = self.emit_jump(ByteCode::JumpIfFalse);
-                self.compile(body, heap);
-
-                if alternate.is_some() {
+                self.compile_stmts(body, heap);
+                if let Some(alt) = alternate {
                     let jump = self.emit_jump(ByteCode::Jump);
                     self.patch_jump(jump_false);
-                    self.compile(alternate.as_ref().unwrap(), heap);
+                    self.compile_stmts(alt, heap);
                     self.patch_jump(jump);
                 } else {
                     self.patch_jump(jump_false);
@@ -205,10 +202,9 @@ impl Compiler {
         match expr {
             Expr::StringLit(val) => {
                 let idx = self.cons.len();
-                self.cons
-                    .push(heap.alloc(crate::heap::HeapObject::String(HeapString {
-                        data: val.to_string(),
-                    })));
+                self.cons.push(heap.alloc(HeapObject::String(HeapString {
+                    data: val.to_string(),
+                })));
                 self.code.push(ByteCode::LdaSmi as u8);
                 self.code.push(idx as u8);
             }
@@ -290,11 +286,7 @@ impl Compiler {
         }
     }
 
-    pub fn equals(&self, other: &Compiler) -> bool {
-        self.code == other.code && self.cons == other.cons
-    }
-
-    fn string_indent(&self, indent: &str) -> String {
+    fn disassemble(&self, indent: &str) -> String {
         let mut b = String::new();
         writeln!(b, "{}Constants: {:?}", indent, self.cons).unwrap();
         writeln!(
@@ -303,9 +295,6 @@ impl Compiler {
             indent, self.next_reg, self.param_count
         )
         .unwrap();
-        if !self.func_map.is_empty() {
-            writeln!(b, "{}FuncMap: {:?}", indent, self.func_map).unwrap();
-        }
         writeln!(b, "{}Bytecode:", indent).unwrap();
 
         let mut i = 0;
@@ -356,26 +345,12 @@ impl Compiler {
                                 } else {
                                     0
                                 };
-                                let name = self
-                                    .func_map
-                                    .iter()
-                                    .find(|&(_, &v)| v == operand)
-                                    .map(|(k, _)| k.as_str());
-                                if let Some(name) = name {
-                                    writeln!(
-                                        b,
-                                        "{}  {:04}  {:<8} [{}] ({}) args@r{}",
-                                        indent, i, op, operand, name, arg_end
-                                    )
-                                    .unwrap();
-                                } else {
-                                    writeln!(
-                                        b,
-                                        "{}  {:04}  {:<8} [{}] args@r{}",
-                                        indent, i, op, operand, arg_end
-                                    )
-                                    .unwrap();
-                                }
+                                writeln!(
+                                    b,
+                                    "{}  {:04}  {:<8} r{} args@r{}",
+                                    indent, i, op, operand, arg_end
+                                )
+                                .unwrap();
                                 i += 1;
                             }
                             _ => {
@@ -391,27 +366,13 @@ impl Compiler {
             }
         }
 
-        for (idx, func) in self.funcs.iter().enumerate() {
-            let name = self
-                .func_map
-                .iter()
-                .find(|&(_, &v)| v == idx)
-                .map(|(k, _)| k.as_str());
-            if let Some(name) = name {
-                writeln!(b, "{}Func [{}] {:?}:", indent, idx, name).unwrap();
-            } else {
-                writeln!(b, "{}Func [{}]:", indent, idx).unwrap();
-            }
-            b.push_str(&func.string_indent(&format!("{}  ", indent)));
-        }
-
         b
     }
 }
 
 impl fmt::Display for Compiler {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.string_indent(""))
+        write!(f, "{}", self.disassemble(""))
     }
 }
 
@@ -421,6 +382,14 @@ mod tests {
     use crate::ast::{Expr, Op, Stmt};
     use crate::heap::Heap;
     use crate::lex::SymbolKind;
+
+    fn compile_and_read(stmts: &[Stmt], heap: &mut Heap) -> (Value, Value) {
+        let mut compiler = Compiler::init();
+        compiler.compile_stmts(stmts, heap);
+        let closure_val = compiler.finalize(heap);
+        let func_val = heap.read_closure(closure_val).function;
+        (closure_val, func_val)
+    }
 
     #[test]
     fn example_from_lesson() {
@@ -446,38 +415,27 @@ mod tests {
             }),
         ];
 
-        let mut got = Compiler::init();
         let mut heap = Heap::new();
-        got.compile(&stmts, &mut heap);
+        let (_, func_val) = compile_and_read(&stmts, &mut heap);
+        let func = heap.read_function(func_val);
 
-        let mut want = Compiler::init();
-        want.cons = vec![Value::from_smi(10), Value::from_smi(20)];
-        want.code = vec![
-            ByteCode::LdaSmi as u8,
-            0,
-            ByteCode::Star as u8,
-            0,
-            ByteCode::LdaSmi as u8,
-            1,
-            ByteCode::Star as u8,
-            1,
-            ByteCode::Ldar as u8,
-            0,
-            ByteCode::Add as u8,
-            1,
-            ByteCode::Star as u8,
-            2,
-            ByteCode::Ldar as u8,
-            0,
-            ByteCode::Star as u8,
-            3,
-            ByteCode::Ldar as u8,
-            2,
-            ByteCode::Mul as u8,
-            3,
-        ];
-
-        assert!(got.equals(&want), "got:\n{}\nwant:\n{}", got, want);
+        assert_eq!(
+            func.code,
+            vec![
+                ByteCode::LdaSmi as u8, 0,
+                ByteCode::Star as u8, 0,
+                ByteCode::LdaSmi as u8, 1,
+                ByteCode::Star as u8, 1,
+                ByteCode::Ldar as u8, 0,
+                ByteCode::Add as u8, 1,
+                ByteCode::Star as u8, 2,
+                ByteCode::Ldar as u8, 0,
+                ByteCode::Star as u8, 3,
+                ByteCode::Ldar as u8, 2,
+                ByteCode::Mul as u8, 3,
+            ]
+        );
+        assert_eq!(func.cons, vec![Value::from_smi(10), Value::from_smi(20)]);
     }
 
     #[test]
@@ -498,27 +456,39 @@ mod tests {
             }),
         ];
 
-        let mut got = Compiler::init();
         let mut heap = Heap::new();
-        got.compile(&stmts, &mut heap);
+        let (_, func_val) = compile_and_read(&stmts, &mut heap);
+        let func = heap.read_function(func_val);
 
-        let mut want = Compiler::init();
-        want.cons = vec![Value::from_smi(10), Value::from_smi(20)];
-        want.code = vec![
-            ByteCode::LdaSmi as u8,
-            0,
-            ByteCode::Star as u8,
-            0,
-            ByteCode::LdaSmi as u8,
-            1,
-            ByteCode::Star as u8,
-            1,
-            ByteCode::Call as u8,
-            0,
-            2,
-        ];
+        assert_eq!(
+            func.code,
+            vec![
+                ByteCode::LdaSmi as u8, 0,
+                ByteCode::Star as u8, 0,
+                ByteCode::LdaSmi as u8, 1,
+                ByteCode::Star as u8, 1,
+                ByteCode::LdaSmi as u8, 2,
+                ByteCode::Star as u8, 2,
+                ByteCode::Call as u8, 0, 3,
+            ]
+        );
+        assert!(func.cons[0].is_heap_object());
+        assert_eq!(func.cons[1], Value::from_smi(10));
+        assert_eq!(func.cons[2], Value::from_smi(20));
 
-        assert!(got.equals(&want), "got:\n{}\nwant:\n{}", got, want);
+        let child_closure = heap.read_closure(func.cons[0]);
+        let child_func = heap.read_function(child_closure.function);
+        assert_eq!(child_func.param_count, 2);
+        assert_eq!(
+            child_func.code,
+            vec![
+                ByteCode::Ldar as u8, 0,
+                ByteCode::Star as u8, 2,
+                ByteCode::Ldar as u8, 1,
+                ByteCode::Add as u8, 2,
+                ByteCode::Return as u8,
+            ]
+        );
     }
 
     #[test]
@@ -529,16 +499,16 @@ mod tests {
             value: Expr::StringLit("hello".to_string()),
         }];
 
-        let mut got = Compiler::init();
         let mut heap = Heap::new();
-        got.compile(&stmts, &mut heap);
+        let (_, func_val) = compile_and_read(&stmts, &mut heap);
+        let func = heap.read_function(func_val);
 
         assert_eq!(
-            got.code,
+            func.code,
             vec![ByteCode::LdaSmi as u8, 0, ByteCode::Star as u8, 0]
         );
-        assert!(got.cons[0].is_smi() == false);
-        assert_eq!(heap.read_string(got.cons[0]), "hello");
+        assert!(func.cons[0].is_heap_object());
+        assert_eq!(heap.read_string(func.cons[0]), "hello");
     }
 
     #[test]
@@ -549,30 +519,25 @@ mod tests {
             right: Box::new(Expr::StringLit("b".to_string())),
         })];
 
-        let mut got = Compiler::init();
         let mut heap = Heap::new();
-        got.compile(&stmts, &mut heap);
+        let (_, func_val) = compile_and_read(&stmts, &mut heap);
+        let func = heap.read_function(func_val);
 
         assert_eq!(
-            got.code,
+            func.code,
             vec![
-                ByteCode::LdaSmi as u8,
-                0,
-                ByteCode::Star as u8,
-                0,
-                ByteCode::LdaSmi as u8,
-                1,
-                ByteCode::TestEqual as u8,
-                0,
+                ByteCode::LdaSmi as u8, 0,
+                ByteCode::Star as u8, 0,
+                ByteCode::LdaSmi as u8, 1,
+                ByteCode::TestEqual as u8, 0,
             ]
         );
-        assert_eq!(heap.read_string(got.cons[0]), "a");
-        assert_eq!(heap.read_string(got.cons[1]), "b");
+        assert_eq!(heap.read_string(func.cons[0]), "a");
+        assert_eq!(heap.read_string(func.cons[1]), "b");
     }
 
     #[test]
     fn conditional_bytecode() {
-        // if (x > 0) { let y = 1; }
         let stmts = vec![Stmt::Cond {
             condition: Expr::Bool {
                 op: Op::Gt,
@@ -587,29 +552,25 @@ mod tests {
             alternate: None,
         }];
 
-        let mut got = Compiler::init();
-        got.symbols.insert("x".to_string(), 0);
-        got.next_reg = 1;
+        let mut compiler = Compiler::init();
+        compiler.symbols.insert("x".to_string(), 0);
+        compiler.next_reg = 1;
         let mut heap = Heap::new();
-        got.compile(&stmts, &mut heap);
+        compiler.compile_stmts(&stmts, &mut heap);
+        let closure_val = compiler.finalize(&mut heap);
+        let func_val = heap.read_closure(closure_val).function;
+        let func = heap.read_function(func_val);
 
         assert_eq!(
-            got.code,
+            func.code,
             vec![
-                ByteCode::Ldar as u8,
-                0,
-                ByteCode::Star as u8,
-                1,
-                ByteCode::LdaSmi as u8,
-                0,
-                ByteCode::TestGreater as u8,
-                1,
-                ByteCode::JumpIfFalse as u8,
-                4,
-                ByteCode::LdaSmi as u8,
-                1,
-                ByteCode::Star as u8,
-                2,
+                ByteCode::Ldar as u8, 0,
+                ByteCode::Star as u8, 1,
+                ByteCode::LdaSmi as u8, 0,
+                ByteCode::TestGreater as u8, 1,
+                ByteCode::JumpIfFalse as u8, 4,
+                ByteCode::LdaSmi as u8, 1,
+                ByteCode::Star as u8, 2,
             ]
         );
     }
@@ -620,14 +581,17 @@ mod tests {
             "x".to_string(),
         ))))];
 
-        let mut got = Compiler::init();
-        got.symbols.insert("x".to_string(), 0);
-        got.next_reg = 1;
+        let mut compiler = Compiler::init();
+        compiler.symbols.insert("x".to_string(), 0);
+        compiler.next_reg = 1;
         let mut heap = Heap::new();
-        got.compile(&stmts, &mut heap);
+        compiler.compile_stmts(&stmts, &mut heap);
+        let closure_val = compiler.finalize(&mut heap);
+        let func_val = heap.read_closure(closure_val).function;
+        let func = heap.read_function(func_val);
 
         assert_eq!(
-            got.code,
+            func.code,
             vec![ByteCode::Ldar as u8, 0, ByteCode::LogicalNot as u8]
         );
     }
