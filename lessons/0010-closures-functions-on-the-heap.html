@@ -1,0 +1,472 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Lesson 10: Closures &mdash; Functions on the Heap</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<h1>Closures &mdash; Functions on the Heap</h1>
+<p class="lesson-meta">Lesson 10 &middot; ~35 min &middot; Prerequisite: <a href="0009-the-isolate.html">Lesson 9</a></p>
+
+<p>
+  Your constant pool lives inside <code>Program</code> &mdash; a Rust struct outside the heap.
+  The GC can&rsquo;t trace it, can&rsquo;t update it, and cloning it into frames creates stale
+  pointers after compaction. The architecture described in the V8 object graph solves this
+  by making functions <strong>heap objects</strong>. The constant pool lives <em>inside</em>
+  the function on the heap, so the GC manages it like everything else.
+</p>
+<p>
+  This lesson restructures the heap to hold complex objects, introduces
+  <code>BytecodeFunction</code> and <code>Closure</code> as heap types, and changes GC
+  from flat root scanning to <strong>recursive graph tracing</strong>.
+</p>
+
+<h2>The Object Graph</h2>
+
+<p>Here&rsquo;s what your runtime looks like after this lesson:</p>
+
+<pre><code>Isolate
+├── acc: Value
+├── heap: Heap
+│   └── objects: Vec&lt;Option&lt;HeapObject&gt;&gt;
+│       ├── [0] String("hello")
+│       ├── [1] BytecodeFunction { code, cons: [Smi(10), @0], param_count, reg_count }
+│       ├── [2] Closure { function: @1, upvalues: [] }
+│       ├── [3] None  ← freed by GC, reusable
+│       └── [4] String("world")
+└── call_stack: Vec&lt;Frame&gt;
+    └── Frame
+        ├── ip: 6
+        ├── reg: [Value; 256]
+        └── closure: Value(@2)  ← heap pointer to Closure</code></pre>
+
+<p>
+  A Frame doesn&rsquo;t borrow a <code>&amp;Program</code> anymore. It holds a <code>Value</code>
+  that points to a <code>Closure</code> on the heap. The Closure points to a
+  <code>BytecodeFunction</code>, also on the heap. The function&rsquo;s constant pool contains
+  <code>Value</code>s that may point to other heap objects. The GC traces through all of this
+  in one recursive pass.
+</p>
+
+<h2>Restructuring the Heap</h2>
+
+<p>
+  Your current heap is a <code>Vec&lt;u8&gt;</code> with manual byte packing. That worked for
+  strings, but packing bytecode arrays, constant pools, and cross-references into raw bytes
+  gets painful. Time to upgrade:
+</p>
+
+<pre><code>pub struct HeapString {
+    pub data: String,
+}
+
+pub struct BytecodeFunction {
+    pub code: Vec&lt;u8&gt;,
+    pub cons: Vec&lt;Value&gt;,
+    pub param_count: usize,
+    pub reg_count: usize,
+}
+
+pub struct HeapClosure {
+    pub function: Value,       // heap pointer to BytecodeFunction
+    pub upvalues: Vec&lt;Value&gt;,  // captured variables
+}
+
+pub enum HeapObject {
+    String(HeapString),
+    Function(BytecodeFunction),
+    Closure(HeapClosure),
+}
+
+pub struct Heap {
+    objects: Vec&lt;Option&lt;HeapObject&gt;&gt;,
+}</code></pre>
+
+<p>
+  A heap pointer in a <code>Value</code> is now an <strong>index</strong> into
+  <code>objects</code> instead of a byte offset. The tagging is the same &mdash;
+  <code>Value::from_heap(idx)</code> still sets bit&nbsp;0 to 1.
+</p>
+
+<div class="callout">
+  <strong>Why move away from <code>Vec&lt;u8&gt;</code>?</strong> Byte packing taught you how
+  real heaps work at the metal. But for learning closures and GC tracing, the byte-packing
+  complexity would dominate the lesson. V8 itself doesn&rsquo;t use raw <code>Vec&lt;u8&gt;</code>
+  &mdash; it has typed object layouts with header words and known field offsets. The enum
+  approach captures the same structure more cleanly in Rust.
+</div>
+
+<h2>Allocation and Reading</h2>
+
+<pre><code>impl Heap {
+    pub fn alloc(&amp;mut self, obj: HeapObject) -> Value {
+        // Reuse a freed slot if available
+        if let Some(idx) = self.objects.iter()
+            .position(|o| o.is_none())
+        {
+            self.objects[idx] = Some(obj);
+            return Value::from_heap(idx);
+        }
+        // Otherwise append
+        let idx = self.objects.len();
+        self.objects.push(Some(obj));
+        Value::from_heap(idx)
+    }
+
+    pub fn read_string(&amp;self, val: Value) -> &amp;str {
+        match &amp;self.objects[val.heap_offset()] {
+            Some(HeapObject::String(s)) => &amp;s.data,
+            other => panic!("expected String, got {:?}", other),
+        }
+    }
+
+    pub fn read_function(&amp;self, val: Value) -> &amp;BytecodeFunction {
+        match &amp;self.objects[val.heap_offset()] {
+            Some(HeapObject::Function(f)) => f,
+            other => panic!("expected Function, got {:?}", other),
+        }
+    }
+
+    pub fn read_closure(&amp;self, val: Value) -> &amp;HeapClosure {
+        match &amp;self.objects[val.heap_offset()] {
+            Some(HeapObject::Closure(c)) => c,
+            other => panic!("expected Closure, got {:?}", other),
+        }
+    }
+}</code></pre>
+
+<p>
+  <code>alloc_string</code> becomes <code>heap.alloc(HeapObject::String(...))</code>.
+  Same for functions and closures. One allocation path for everything.
+</p>
+
+<h2>GC: Recursive Tracing</h2>
+
+<p>
+  This is the big change. Your current GC scans roots and that&rsquo;s it &mdash; strings
+  don&rsquo;t reference other objects. But now:
+</p>
+<ul>
+  <li>A <strong>Closure</strong> references a BytecodeFunction + upvalues</li>
+  <li>A <strong>BytecodeFunction</strong>&rsquo;s constant pool contains Values that may point
+      to strings, other functions, or other closures</li>
+</ul>
+
+<p>
+  The GC must <strong>trace the graph</strong>: visit a root, mark it, then recursively visit
+  everything it references.
+</p>
+
+<pre><code>impl Heap {
+    pub fn collect(&amp;mut self, roots: &amp;[Value]) {
+        // Mark phase: trace from roots
+        let mut marked = vec![false; self.objects.len()];
+        for &amp;root in roots {
+            self.mark(&amp;mut marked, root);
+        }
+        // Sweep phase: free unmarked objects
+        for i in 0..self.objects.len() {
+            if !marked[i] {
+                self.objects[i] = None;
+            }
+        }
+    }
+
+    fn mark(&amp;self, marked: &amp;mut Vec&lt;bool&gt;, val: Value) {
+        if !val.is_heap_object() { return; }
+        let idx = val.heap_offset();
+        if idx >= self.objects.len() || marked[idx] { return; }
+        marked[idx] = true;
+
+        match &amp;self.objects[idx] {
+            Some(HeapObject::String(_)) => {
+                // no references to trace
+            }
+            Some(HeapObject::Function(f)) => {
+                for &amp;v in &amp;f.cons {
+                    self.mark(marked, v);
+                }
+            }
+            Some(HeapObject::Closure(c)) => {
+                self.mark(marked, c.function);
+                for &amp;v in &amp;c.upvalues {
+                    self.mark(marked, v);
+                }
+            }
+            None => {}
+        }
+    }
+}</code></pre>
+
+<div class="callout">
+  <strong>Key insight:</strong> <code>mark</code> takes <code>&amp;self</code> (immutable)
+  and <code>&amp;mut marked</code> (a local <code>Vec&lt;bool&gt;</code>). Since
+  <code>marked</code> is not part of <code>self</code>, Rust allows this &mdash; no borrow
+  conflict. The sweep phase runs after marking is done, using <code>&amp;mut self</code>.
+</div>
+
+<h3>No more remapping</h3>
+
+<p>
+  Objects don&rsquo;t move. A <code>None</code> slot is just a hole that gets reused on the
+  next allocation. This means <strong>no remap, no pointer updating</strong> &mdash; heap
+  indices stay stable across GC cycles. The entire stale-cons problem dissolves: the constant
+  pool lives on the heap at a fixed index, and the GC keeps it alive by tracing through the
+  closure.
+</p>
+<p>
+  The tradeoff: fragmentation. Many <code>None</code> holes waste space. V8 handles this with
+  compaction in its old generation &mdash; you could add that later. For now, mark-sweep with
+  slot reuse is clean and correct.
+</p>
+
+<div class="quiz" data-correct="1"
+     data-right="Correct! The GC traces: root → Closure → function field → BytecodeFunction → cons pool → string. Every link in the chain is followed recursively."
+     data-wrong="Think about the chain: which heap object references which? The GC follows each reference from the root all the way through.">
+  <div class="quiz-question">
+    A Frame holds a Closure. The Closure points to a BytecodeFunction. The function&rsquo;s
+    constant pool holds a string. How does the GC know the string is alive?
+  </div>
+  <div class="quiz-options">
+    <div class="quiz-option">The string is always alive because it&rsquo;s a constant</div>
+    <div class="quiz-option">The GC traces Closure &rarr; Function &rarr; cons &rarr; string</div>
+    <div class="quiz-option">The VM registers the string as a separate root</div>
+    <div class="quiz-option">Constants are stored outside the heap and never collected</div>
+  </div>
+  <div class="quiz-feedback"></div>
+</div>
+
+<h2>Closures</h2>
+
+<p>
+  A Closure is the runtime representation of a function. It has two parts:
+</p>
+
+<ol>
+  <li><strong>function:</strong> a heap pointer to the <code>BytecodeFunction</code>
+      (the compiled template &mdash; code + constants). Multiple closures can share
+      the same function.</li>
+  <li><strong>upvalues:</strong> the captured variables from enclosing scopes. This is
+      what makes closures <em>close over</em> their environment.</li>
+</ol>
+
+<pre><code>// Shared template — one per function declaration
+BytecodeFunction { code: [...], cons: [Smi(1), @3], param_count: 1, reg_count: 2 }
+
+// Runtime instances — one per function() call site
+Closure { function: @5, upvalues: [@7] }    // captures variable from outer scope
+Closure { function: @5, upvalues: [@12] }   // same function, different capture</code></pre>
+
+<p>
+  For now, if you don&rsquo;t need variable capture yet, upvalues is an empty
+  <code>Vec</code>. The Closure is still useful because it gives the GC a single root to
+  trace for the entire function + its constants.
+</p>
+
+<h2>Upvalues: Capturing Variables</h2>
+
+<p>
+  When a nested function references a variable from its enclosing function, that variable
+  must outlive the enclosing function&rsquo;s frame. Consider:
+</p>
+
+<pre><code>function makeCounter() {
+    let count = 0;
+    function increment() {
+        count = count + 1;
+        return count;
+    }
+    return increment;
+}
+let counter = makeCounter();
+counter();  // 1
+counter();  // 2</code></pre>
+
+<p>
+  After <code>makeCounter</code> returns, its frame is gone &mdash; but <code>count</code>
+  must survive because <code>increment</code> still uses it. An <strong>upvalue</strong>
+  is the mechanism that makes this work:
+</p>
+
+<h3>Open upvalue</h3>
+<p>
+  While the enclosing function is still running, the upvalue points to the variable&rsquo;s
+  slot on the call stack. Reads and writes go straight to the live register:
+</p>
+<pre><code>Upvalue::Open { frame_idx: 0, reg: 3 }
+  // reads/writes frame 0, register 3 directly</code></pre>
+
+<h3>Closed upvalue</h3>
+<p>
+  When the enclosing frame pops, the variable would be destroyed. Instead, its value is
+  <strong>copied into the upvalue itself</strong>. The upvalue now owns the value:
+</p>
+<pre><code>// Before frame pop:  Upvalue::Open { frame_idx: 0, reg: 3 }
+// After frame pop:   Upvalue::Closed { value: Smi(42) }
+  // the closure still works — it reads from the upvalue, not the dead frame</code></pre>
+
+<p>
+  The closing happens when a frame pops: scan all open upvalues, and for any that point into
+  the popping frame, copy the value in and convert to <code>Closed</code>.
+</p>
+
+<div class="quiz" data-correct="2"
+     data-right="Correct! The upvalue starts as Open (pointing into the stack). When the frame pops, it becomes Closed (owns the value). The closure continues reading from it."
+     data-wrong="Think about what happens to the variable when the frame is popped. The upvalue is the bridge between the dead frame and the living closure.">
+  <div class="quiz-question">
+    A closure captures variable <code>x</code> from its parent frame via an upvalue.
+    The parent frame returns. What happens to the upvalue?
+  </div>
+  <div class="quiz-options">
+    <div class="quiz-option">The upvalue becomes invalid and the closure crashes</div>
+    <div class="quiz-option">The upvalue is deleted and the closure reads a default value</div>
+    <div class="quiz-option">The upvalue copies the value from the register and becomes Closed</div>
+    <div class="quiz-option">The parent frame is kept alive as long as the closure exists</div>
+  </div>
+  <div class="quiz-feedback"></div>
+</div>
+
+<h2>Frames Reference Closures</h2>
+
+<p>
+  The Frame no longer borrows <code>&amp;Program</code> or clones a cons pool. It holds a
+  <code>Value</code> pointing to a Closure on the heap:
+</p>
+
+<pre><code>struct Frame {
+    ip: usize,
+    reg: [Value; 256],
+    closure: Value,       // heap pointer to Closure
+}
+
+// Reading bytecode in the VM:
+let closure = self.heap.read_closure(stack[fi].closure);
+let function = self.heap.read_function(closure.function);
+let opcode = function.code[stack[fi].ip];
+
+// Loading a constant:
+let idx = function.code[stack[fi].ip] as usize;
+self.acc = function.cons[idx];</code></pre>
+
+<p>
+  No <code>&amp;Program</code> borrow. No cloned cons. The function and its constant pool
+  live on the heap and the GC manages them. Fresh frames always read from the live heap
+  object &mdash; never from a stale clone.
+</p>
+
+<h2>Compilation</h2>
+
+<p>
+  The compiler&rsquo;s job changes. Instead of building a <code>Program</code> struct, it
+  allocates objects on the heap and returns a <code>Value</code>:
+</p>
+
+<pre><code>impl Compiler {
+    pub fn compile(
+        &amp;mut self,
+        stmts: &amp;[Stmt],
+        heap: &amp;mut Heap,
+    ) -> Value {
+        // 1. Compile bytecode into self.code, constants into self.cons
+        for stmt in stmts {
+            self.compile_stmt(stmt, heap);
+        }
+
+        // 2. Allocate the BytecodeFunction on the heap
+        let func_val = heap.alloc(HeapObject::Function(
+            BytecodeFunction {
+                code: std::mem::take(&amp;mut self.code),
+                cons: std::mem::take(&amp;mut self.cons),
+                param_count: self.param_count,
+                reg_count: self.next_reg,
+            }
+        ));
+
+        // 3. Wrap in a Closure (no upvalues yet)
+        heap.alloc(HeapObject::Closure(HeapClosure {
+            function: func_val,
+            upvalues: vec![],
+        }))
+    }
+}</code></pre>
+
+<p>
+  For <code>FuncDecl</code>, the child compiler recursively compiles the function body,
+  allocates the child BytecodeFunction + Closure on the heap, and the parent stores the
+  Closure Value in its constant pool &mdash; so the <code>Call</code> instruction can load it.
+</p>
+
+<h2>Implementation Steps</h2>
+
+<ol>
+  <li><strong>Define HeapObject types</strong> &mdash; <code>HeapString</code>,
+      <code>BytecodeFunction</code>, <code>HeapClosure</code>, the <code>HeapObject</code>
+      enum</li>
+  <li><strong>Rewrite Heap</strong> &mdash; <code>Vec&lt;Option&lt;HeapObject&gt;&gt;</code>
+      with <code>alloc</code>, <code>read_string</code>, <code>read_function</code>,
+      <code>read_closure</code></li>
+  <li><strong>Rewrite GC</strong> &mdash; recursive <code>mark</code> + <code>sweep</code>,
+      no remap</li>
+  <li><strong>Change Frame</strong> &mdash; replace <code>program: &amp;Program</code> and
+      <code>cons: Vec&lt;Value&gt;</code> with <code>closure: Value</code></li>
+  <li><strong>Change compiler</strong> &mdash; allocate BytecodeFunction and Closure on heap,
+      return <code>Value</code></li>
+  <li><strong>Change VM</strong> &mdash; read bytecode and constants through
+      <code>heap.read_closure</code> / <code>heap.read_function</code></li>
+  <li><strong>Update tests</strong> &mdash; significant refactor, since Program and Frame
+      shapes change</li>
+</ol>
+
+<div class="callout warn">
+  <strong>This is a big refactor.</strong> Expect to touch every file. Start with the Heap
+  restructure and get <code>alloc</code>/<code>read_string</code> working with existing tests.
+  Then add Function/Closure types. Then change Frame and the VM. Keep tests green after each
+  step &mdash; don&rsquo;t try to change everything at once.
+</div>
+
+<h2>Where This Lands You</h2>
+
+<p>After this lesson, your architecture matches the V8 object graph:</p>
+
+<table class="ref-table">
+  <thead>
+    <tr><th>Concept</th><th>Your implementation</th><th>V8 equivalent</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Compiled code</td><td><code>BytecodeFunction</code> (on heap)</td><td><code>SharedFunctionInfo</code> + <code>BytecodeArray</code></td></tr>
+    <tr><td>Runtime function</td><td><code>Closure</code> (on heap)</td><td><code>JSFunction</code></td></tr>
+    <tr><td>Constants</td><td><code>cons: Vec&lt;Value&gt;</code> in BytecodeFunction</td><td><code>ConstantPool</code> (FixedArray on heap)</td></tr>
+    <tr><td>Captured vars</td><td><code>upvalues: Vec&lt;Value&gt;</code> in Closure</td><td><code>Context</code> chain</td></tr>
+    <tr><td>GC tracing</td><td>Recursive mark through object references</td><td>Concurrent marking with write barriers</td></tr>
+    <tr><td>Frame</td><td>Holds <code>closure: Value</code></td><td>Stack frame holds pointer to <code>JSFunction</code></td></tr>
+  </tbody>
+</table>
+
+<div class="callout">
+  <strong>Primary source:</strong> Chapter 25 of
+  <a href="https://craftinginterpreters.com/closures.html">Crafting Interpreters</a>
+  implements closures with upvalues for a bytecode VM in C &mdash; the open/closed upvalue
+  design is exactly what&rsquo;s described here. For V8&rsquo;s closure implementation,
+  see <code>src/objects/js-function.h</code> (JSFunction = Closure) and
+  <code>src/objects/shared-function-info.h</code> (SharedFunctionInfo = BytecodeFunction template).
+</div>
+
+<p>
+  This is the hardest refactor so far. Take it in steps. Ask your teacher if you get stuck
+  on the Rust ownership dance &mdash; reading heap objects while mutating the VM is the
+  main friction point.
+</p>
+
+<nav class="lesson-nav">
+  <a href="0009-the-isolate.html">&larr; Lesson 9: The Isolate</a>
+  <a href="../reference/bytecode-instruction-set.html">Reference &rarr;</a>
+</nav>
+
+<footer>g8 teaching workspace</footer>
+
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

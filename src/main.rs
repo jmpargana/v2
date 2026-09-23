@@ -1,10 +1,10 @@
 mod ast;
 mod bytecode;
 mod heap;
+mod isolate;
 mod lex;
 mod parser;
 mod value;
-mod vm;
 
 use std::env;
 use std::fs;
@@ -22,14 +22,8 @@ fn main() {
         process::exit(1);
     });
 
-    let tokens = lex::Lexer::lex(&src);
-    let stmts = parser::Parser::new(tokens).parse();
-    let mut heap = heap::Heap::new();
-    let mut program = bytecode::Program::new();
-    let default_gc_threshold = 1024;
-    program.compile(&stmts, &mut heap);
-    let mut vm = vm::VM::new(heap, default_gc_threshold);
-    let result = vm.fde(&program);
+    let mut vm = isolate::Isolate::new();
+    let result = vm.eval(&src);
 
     println!("{}", vm.format_value(result));
 }

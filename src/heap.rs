@@ -3,7 +3,31 @@ use std::collections::{HashMap, HashSet};
 use crate::value::Value;
 
 pub struct Heap {
-    bytes: Vec<u8>,
+    objects: Vec<Option<HeapObject>>,
+}
+
+pub enum HeapObject {
+    String(HeapString),
+    Function(BytecodeFunction),
+    Closure(HeapClosure),
+}
+
+pub struct HeapString {
+    pub data: String,
+}
+
+pub struct HeapClosure {
+    pub function: Value,
+    // TODO: implement later the open and closed
+    pub upvalues: Vec<Value>,
+}
+
+pub struct BytecodeFunction {
+    pub code: Vec<u8>,
+    pub cons: Vec<Value>,
+    pub param_count: usize,
+    // Why?
+    pub reg_count: usize,
 }
 
 #[repr(u8)]
@@ -14,65 +38,85 @@ pub enum InstanceType {
 // TODO: abstract write and read value without hardcoded function.
 impl Heap {
     pub fn new() -> Self {
-        Self { bytes: Vec::new() }
+        Self {
+            objects: Vec::new(),
+        }
     }
 
-    pub fn alloc_string(&mut self, s: &str) -> Value {
-        let offset = self.bytes.len();
-
-        self.bytes.push(InstanceType::String as u8);
-        let len = s.len() as u32;
-        self.bytes.extend_from_slice(&len.to_le_bytes());
-        self.bytes.extend_from_slice(s.as_bytes());
-
-        Value::from_heap(offset)
+    pub fn alloc(&mut self, obj: HeapObject) -> Value {
+        if let Some(idx) = self.objects.iter().position(|o| o.is_none()) {
+            self.objects[idx] = Some(obj);
+            return Value::from_heap(idx);
+        }
+        let idx = self.objects.len();
+        self.objects.push(Some(obj));
+        Value::from_heap(idx)
     }
 
     pub fn read_string(&self, val: Value) -> &str {
-        let mut offset = val.heap_offset();
-        // skip instance type
-        offset += 1;
-        let str_len = self.bytes[offset..offset + 4].try_into().unwrap();
-        let str_len = u32::from_le_bytes(str_len) as usize;
-        offset += 4;
-        str::from_utf8(&self.bytes[offset..offset + str_len]).unwrap()
-    }
-
-    fn object_size(&self, offset: usize) -> usize {
-        match self.bytes[offset] {
-            1 => {
-                let len_bytes: [u8; 4] = self.bytes[offset + 1..offset + 5].try_into().unwrap();
-                let len = u32::from_le_bytes(len_bytes) as usize;
-                1 + 4 + len
-            }
-            t => panic!("unknown object type {} at offset {}", t, offset),
+        match &self.objects[val.heap_offset()] {
+            Some(HeapObject::String(s)) => &s.data,
+            other => panic!("expected String, got {:?}", other),
         }
     }
 
-    pub fn collect(&mut self, live: &HashSet<usize>) -> HashMap<usize, usize> {
-        let mut new_bytes = Vec::new();
-        let mut remap = HashMap::new();
-        let mut pos = 0;
+    pub fn read_function(&self, val: Value) -> &BytecodeFunction {
+        match &self.objects[val.heap_offset()] {
+            Some(HeapObject::Function(f)) => f,
+            other => panic!("expected Function, got {:?}", other),
+        }
+    }
 
-        while pos < self.bytes.len() {
-            let size = self.object_size(pos);
-            if live.contains(&pos) {
-                let new_offset = new_bytes.len();
-                remap.insert(pos, new_offset);
-                new_bytes.extend_from_slice(&self.bytes[pos..pos + size]);
-            }
-            pos += size;
+    pub fn read_closure(&self, val: Value) -> &HeapClosure {
+        match &self.objects[val.heap_offset()] {
+            Some(HeapObject::Closure(c)) => c,
+            other => panic!("expected Closure, got {:?}", other),
+        }
+    }
+
+    // Mark + Compact
+    pub fn collect(&mut self, roots: &[Value]) {
+        let mut marked = [false; self.objects.len()];
+
+        for &root in roots {
+            self.mark(&mut marked, root);
         }
 
-        self.bytes = new_bytes;
-        remap
+        for i in 0..self.objects.len() {
+            if !marked[i] {
+                self.objects[i] = None;
+            }
+        }
     }
 
-    pub(crate) fn is_over_threshold(&self, gc_threshold: usize) -> bool {
-        self.bytes.len() >= gc_threshold
-    }
+    fn mark(&self, marked: &mut Vec<bool>, val: Value) {
+        if !val.is_heap_object() {
+            return;
+        }
+        let idx = val.heap_offset();
 
-    pub(crate) fn len(&self) -> usize {
-        self.bytes.len()
+        if idx >= self.objects.len() || marked[idx] {
+            return;
+        }
+
+        marked[idx] = true;
+
+        match &self.objects[idx] {
+            Some(HeapObject::String(_)) => {
+                // nothing to be done
+            }
+            Some(HeapObject::Function(c)) => {
+                for &v in &c.cons {
+                    self.mark(marked, v);
+                }
+            }
+            Some(HeapObject::Closure(c)) => {
+                self.mark(marked, c.function);
+                for &v in &c.upvalues {
+                    self.mark(marked, v);
+                }
+            }
+            None => todo!(),
+        }
     }
 }
