@@ -1,3 +1,9 @@
+/// The universal currency of the VM. A 64-bit tagged value that is either
+/// an inline small integer (Smi) or a pointer to a HeapObject.
+/// Passed on the stack, stored in registers, constant pools, and object slots.
+///
+/// Tagging scheme: bit 0 = 0 → Smi (value << 1), bit 0 = 1 → heap pointer (index << 1 | 1)
+/// Future: NaN-boxing for doubles, or extend tag bits for null/undefined/boolean
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Value(u64);
 

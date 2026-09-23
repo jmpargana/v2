@@ -1,5 +1,5 @@
 use crate::ast::{Expr, Op, Stmt};
-use crate::heap::{BytecodeFunction, Heap, HeapClosure, HeapObject, HeapString};
+use crate::heap::{BytecodeFunction, Heap, Closure, HeapObject, HeapString};
 use crate::value::Value;
 use std::collections::HashMap;
 use std::fmt::{self, Write};
@@ -87,10 +87,17 @@ impl fmt::Display for ByteCode {
     }
 }
 
+/// Compiles AST statements into bytecode for a single function scope.
+/// Each FuncDecl creates a child Compiler; the root Compiler produces the
+/// top-level program. Call compile_stmts() to emit bytecode, then finalize()
+/// to allocate the BytecodeFunction + Closure on the heap.
+///
+/// The closures map tracks function declarations in the current scope so that
+/// child compilers can inherit them (enabling recursive and cross-scope calls).
 #[derive(Debug)]
 pub struct Compiler {
     pub code: Vec<u8>,
-    pub cons: Vec<Value>,
+    pub constant_pool: Vec<Value>,
     pub param_count: usize,
     pub next_reg: usize,
     pub symbols: HashMap<String, usize>,
@@ -101,7 +108,7 @@ impl Compiler {
     pub fn init() -> Self {
         Compiler {
             code: Vec::new(),
-            cons: Vec::new(),
+            constant_pool: Vec::new(),
             param_count: 0,
             next_reg: 0,
             symbols: HashMap::new(),
@@ -124,11 +131,11 @@ impl Compiler {
     pub fn finalize(mut self, heap: &mut Heap) -> Value {
         let func = heap.alloc(HeapObject::Function(BytecodeFunction {
             code: std::mem::take(&mut self.code),
-            cons: std::mem::take(&mut self.cons),
+            constant_pool: std::mem::take(&mut self.constant_pool),
             param_count: self.param_count,
-            reg_count: self.next_reg,
+            register_count: self.next_reg,
         }));
-        heap.alloc(HeapObject::Closure(HeapClosure {
+        heap.alloc(HeapObject::Closure(Closure {
             function: func,
             upvalues: vec![],
         }))
@@ -147,17 +154,17 @@ impl Compiler {
                 // Two-phase allocation: create placeholder so recursive/sibling calls work
                 let placeholder_func = heap.alloc(HeapObject::Function(BytecodeFunction {
                     code: vec![],
-                    cons: vec![],
+                    constant_pool: vec![],
                     param_count: params.len(),
-                    reg_count: 0,
+                    register_count: 0,
                 }));
-                let closure_val = heap.alloc(HeapObject::Closure(HeapClosure {
+                let closure_val = heap.alloc(HeapObject::Closure(Closure {
                     function: placeholder_func,
                     upvalues: vec![],
                 }));
 
-                let cons_idx = self.cons.len();
-                self.cons.push(closure_val);
+                let cons_idx = self.constant_pool.len();
+                self.constant_pool.push(closure_val);
                 self.code.push(ByteCode::LdaSmi as u8);
                 self.code.push(cons_idx as u8);
                 let reg = self.alloc_reg();
@@ -182,8 +189,8 @@ impl Compiler {
                     .collect();
                 parent_closures.sort_by(|a, b| a.0.cmp(&b.0));
                 for (fn_name, fn_val) in &parent_closures {
-                    let cidx = child.cons.len();
-                    child.cons.push(*fn_val);
+                    let cidx = child.constant_pool.len();
+                    child.constant_pool.push(*fn_val);
                     child.code.push(ByteCode::LdaSmi as u8);
                     child.code.push(cidx as u8);
                     let creg = child.alloc_reg();
@@ -196,9 +203,9 @@ impl Compiler {
 
                 let real_func = heap.alloc(HeapObject::Function(BytecodeFunction {
                     code: child.code,
-                    cons: child.cons,
+                    constant_pool: child.constant_pool,
                     param_count: child.param_count,
-                    reg_count: child.next_reg,
+                    register_count: child.next_reg,
                 }));
                 heap.patch_closure(closure_val, real_func);
             }
@@ -243,16 +250,16 @@ impl Compiler {
     fn compile_expr(&mut self, expr: &Expr, heap: &mut Heap) {
         match expr {
             Expr::StringLit(val) => {
-                let idx = self.cons.len();
-                self.cons.push(heap.alloc(HeapObject::String(HeapString {
+                let idx = self.constant_pool.len();
+                self.constant_pool.push(heap.alloc(HeapObject::String(HeapString {
                     data: val.to_string(),
                 })));
                 self.code.push(ByteCode::LdaSmi as u8);
                 self.code.push(idx as u8);
             }
             Expr::NumberLit(value) => {
-                let idx = self.cons.len();
-                self.cons.push(Value::from_smi(*value));
+                let idx = self.constant_pool.len();
+                self.constant_pool.push(Value::from_smi(*value));
                 self.code.push(ByteCode::LdaSmi as u8);
                 self.code.push(idx as u8);
             }
@@ -330,7 +337,7 @@ impl Compiler {
 
     fn disassemble(&self, indent: &str) -> String {
         let mut b = String::new();
-        writeln!(b, "{}Constants: {:?}", indent, self.cons).unwrap();
+        writeln!(b, "{}Constants: {:?}", indent, self.constant_pool).unwrap();
         writeln!(
             b,
             "{}Registers: {}, Params: {}",
@@ -352,11 +359,11 @@ impl Compiler {
                         let operand = self.code[i + 1] as usize;
                         match op {
                             ByteCode::LdaSmi | ByteCode::Push => {
-                                if operand < self.cons.len() {
+                                if operand < self.constant_pool.len() {
                                     writeln!(
                                         b,
                                         "{}  {:04}  {:<8} [{}] ({:?})",
-                                        indent, i, op, operand, self.cons[operand]
+                                        indent, i, op, operand, self.constant_pool[operand]
                                     )
                                     .unwrap();
                                 } else {
@@ -477,7 +484,7 @@ mod tests {
                 ByteCode::Mul as u8, 3,
             ]
         );
-        assert_eq!(func.cons, vec![Value::from_smi(10), Value::from_smi(20)]);
+        assert_eq!(func.constant_pool, vec![Value::from_smi(10), Value::from_smi(20)]);
     }
 
     #[test]
@@ -514,11 +521,11 @@ mod tests {
                 ByteCode::Call as u8, 0, 3,
             ]
         );
-        assert!(func.cons[0].is_heap_object());
-        assert_eq!(func.cons[1], Value::from_smi(10));
-        assert_eq!(func.cons[2], Value::from_smi(20));
+        assert!(func.constant_pool[0].is_heap_object());
+        assert_eq!(func.constant_pool[1], Value::from_smi(10));
+        assert_eq!(func.constant_pool[2], Value::from_smi(20));
 
-        let child_closure = heap.read_closure(func.cons[0]);
+        let child_closure = heap.read_closure(func.constant_pool[0]);
         let child_func = heap.read_function(child_closure.function);
         assert_eq!(child_func.param_count, 2);
         assert_eq!(
@@ -535,8 +542,8 @@ mod tests {
                 ByteCode::Return as u8,
             ]
         );
-        assert_eq!(child_func.cons.len(), 1);
-        assert!(child_func.cons[0].is_heap_object());
+        assert_eq!(child_func.constant_pool.len(), 1);
+        assert!(child_func.constant_pool[0].is_heap_object());
     }
 
     #[test]
@@ -555,8 +562,8 @@ mod tests {
             func.code,
             vec![ByteCode::LdaSmi as u8, 0, ByteCode::Star as u8, 0]
         );
-        assert!(func.cons[0].is_heap_object());
-        assert_eq!(heap.read_string(func.cons[0]), "hello");
+        assert!(func.constant_pool[0].is_heap_object());
+        assert_eq!(heap.read_string(func.constant_pool[0]), "hello");
     }
 
     #[test]
@@ -580,8 +587,8 @@ mod tests {
                 ByteCode::TestEqual as u8, 0,
             ]
         );
-        assert_eq!(heap.read_string(func.cons[0]), "a");
-        assert_eq!(heap.read_string(func.cons[1]), "b");
+        assert_eq!(heap.read_string(func.constant_pool[0]), "a");
+        assert_eq!(heap.read_string(func.constant_pool[1]), "b");
     }
 
     #[test]

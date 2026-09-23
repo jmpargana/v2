@@ -7,16 +7,65 @@ use crate::{
 };
 use std::fmt;
 
+/// A flat array of Value slots subdivided into Frames.
+/// Frames are windows into this array — pushing a call extends the slots,
+/// popping truncates back. More cache-friendly than per-frame register arrays.
+///
+/// This is the runtime equivalent of the "call stack" in V8's execution model.
+/// The slots hold register values for all active frames contiguously.
+struct CallStack {
+    slots: Vec<Value>,
+    frames: Vec<Frame>,
+}
+
+/// A lightweight descriptor pointing into the CallStack. Not a heap object.
+/// Knows where its registers start, which instruction to execute next,
+/// and which Closure provides the bytecode and captured environment.
 struct Frame {
-    ip: usize,
-    reg: [Value; 256],
+    base_offset: usize,
+    pc: usize,
     closure: Value,
 }
 
+impl CallStack {
+    fn new(closure: Value, register_count: usize) -> Self {
+        CallStack {
+            slots: vec![Value::default(); register_count],
+            frames: vec![Frame {
+                base_offset: 0,
+                pc: 0,
+                closure,
+            }],
+        }
+    }
+
+    fn reg(&self, fi: usize, idx: usize) -> Value {
+        self.slots[self.frames[fi].base_offset + idx]
+    }
+
+    fn set_reg(&mut self, fi: usize, idx: usize, val: Value) {
+        self.slots[self.frames[fi].base_offset + idx] = val;
+    }
+
+    fn pop_frame(&mut self) {
+        if let Some(frame) = self.frames.pop() {
+            self.slots.truncate(frame.base_offset);
+        }
+    }
+}
+
+/// The Isolate is a self-contained execution context — V8's core abstraction.
+/// Each Isolate has its own heap, GC, and execution state. No shared mutable
+/// state with any other Isolate: two Isolates in the same process see
+/// completely separate realities.
+///
+/// Source code goes in via eval(), a result comes out. The caller never
+/// touches the heap or bytecode directly.
 pub struct Isolate {
     acc: Value,
     heap: Heap,
     gc_threshold: usize,
+    // globals: GlobalScope,  // top-level variable bindings (or a JSObject acting as the global object)
 }
 
 impl fmt::Display for Isolate {
@@ -69,128 +118,137 @@ impl Isolate {
         }
     }
 
-    fn read_byte(&self, stack: &[Frame], fi: usize) -> u8 {
-        let closure = self.heap.read_closure(stack[fi].closure);
+    fn read_byte(&self, call_stack: &CallStack, fi: usize) -> u8 {
+        let closure = self.heap.read_closure(call_stack.frames[fi].closure);
         let func = self.heap.read_function(closure.function);
-        func.code[stack[fi].ip]
+        func.code[call_stack.frames[fi].pc]
     }
 
-    fn code_len(&self, stack: &[Frame], fi: usize) -> usize {
-        let closure = self.heap.read_closure(stack[fi].closure);
+    fn code_len(&self, call_stack: &CallStack, fi: usize) -> usize {
+        let closure = self.heap.read_closure(call_stack.frames[fi].closure);
         let func = self.heap.read_function(closure.function);
         func.code.len()
     }
 
-    fn read_cons(&self, stack: &[Frame], fi: usize, idx: usize) -> Value {
-        let closure = self.heap.read_closure(stack[fi].closure);
+    fn read_constant(&self, call_stack: &CallStack, fi: usize, idx: usize) -> Value {
+        let closure = self.heap.read_closure(call_stack.frames[fi].closure);
         let func = self.heap.read_function(closure.function);
-        func.cons[idx]
+        func.constant_pool[idx]
     }
 
     pub(crate) fn run(&mut self, closure: Value) -> Value {
-        let mut stack: Vec<Frame> = vec![Frame {
-            ip: 0,
-            reg: [Default::default(); 256],
-            closure,
-        }];
+        let register_count = {
+            let c = self.heap.read_closure(closure);
+            self.heap.read_function(c.function).register_count
+        };
+        let mut call_stack = CallStack::new(closure, register_count);
 
-        while !stack.is_empty() {
-            let fi = stack.len() - 1;
-            if stack[fi].ip >= self.code_len(&stack, fi) {
-                stack.pop();
+        while !call_stack.frames.is_empty() {
+            let fi = call_stack.frames.len() - 1;
+            if call_stack.frames[fi].pc >= self.code_len(&call_stack, fi) {
+                call_stack.pop_frame();
                 continue;
             }
 
-            let opcode = ByteCode::from(self.read_byte(&stack, fi));
-            stack[fi].ip += 1;
+            let opcode = ByteCode::from(self.read_byte(&call_stack, fi));
+            call_stack.frames[fi].pc += 1;
 
             match opcode {
                 ByteCode::LdaSmi => {
-                    let idx = self.read_byte(&stack, fi) as usize;
-                    stack[fi].ip += 1;
-                    self.acc = self.read_cons(&stack, fi, idx);
+                    let idx = self.read_byte(&call_stack, fi) as usize;
+                    call_stack.frames[fi].pc += 1;
+                    self.acc = self.read_constant(&call_stack, fi, idx);
                 }
                 ByteCode::Star => {
-                    let idx = self.read_byte(&stack, fi) as usize;
-                    stack[fi].ip += 1;
-                    stack[fi].reg[idx] = self.acc;
+                    let idx = self.read_byte(&call_stack, fi) as usize;
+                    call_stack.frames[fi].pc += 1;
+                    call_stack.set_reg(fi, idx, self.acc);
                 }
                 ByteCode::Ldar => {
-                    let idx = self.read_byte(&stack, fi) as usize;
-                    stack[fi].ip += 1;
-                    self.acc = stack[fi].reg[idx];
+                    let idx = self.read_byte(&call_stack, fi) as usize;
+                    call_stack.frames[fi].pc += 1;
+                    self.acc = call_stack.reg(fi, idx);
                 }
                 ByteCode::Add => {
-                    let idx = self.read_byte(&stack, fi) as usize;
-                    stack[fi].ip += 1;
-                    if self.acc.is_heap_object() && stack[fi].reg[idx].is_heap_object() {
-                        let a = self.heap.read_string(stack[fi].reg[idx]).to_string();
+                    let idx = self.read_byte(&call_stack, fi) as usize;
+                    call_stack.frames[fi].pc += 1;
+                    if self.acc.is_heap_object() && call_stack.reg(fi, idx).is_heap_object() {
+                        let a = self.heap.read_string(call_stack.reg(fi, idx)).to_string();
                         let b = self.heap.read_string(self.acc).to_string();
                         let result = a + &b;
                         self.acc = self.heap.alloc_string(&result);
                         if self.heap.is_over_threshold(self.gc_threshold) {
-                            self.collect_garbage(&stack);
+                            self.collect_garbage(&call_stack);
                         }
                     } else {
                         self.acc =
-                            Value::from_smi(self.acc.as_smi() + stack[fi].reg[idx].as_smi());
+                            Value::from_smi(self.acc.as_smi() + call_stack.reg(fi, idx).as_smi());
                     }
                 }
                 ByteCode::Sub => {
-                    let idx = self.read_byte(&stack, fi) as usize;
-                    stack[fi].ip += 1;
-                    self.acc = Value::from_smi(stack[fi].reg[idx].as_smi() - self.acc.as_smi());
+                    let idx = self.read_byte(&call_stack, fi) as usize;
+                    call_stack.frames[fi].pc += 1;
+                    self.acc =
+                        Value::from_smi(call_stack.reg(fi, idx).as_smi() - self.acc.as_smi());
                 }
                 ByteCode::Mul => {
-                    let idx = self.read_byte(&stack, fi) as usize;
-                    stack[fi].ip += 1;
-                    self.acc = Value::from_smi(self.acc.as_smi() * stack[fi].reg[idx].as_smi());
+                    let idx = self.read_byte(&call_stack, fi) as usize;
+                    call_stack.frames[fi].pc += 1;
+                    self.acc =
+                        Value::from_smi(self.acc.as_smi() * call_stack.reg(fi, idx).as_smi());
                 }
                 ByteCode::Div => {
-                    let idx = self.read_byte(&stack, fi) as usize;
-                    stack[fi].ip += 1;
-                    self.acc = Value::from_smi(stack[fi].reg[idx].as_smi() / self.acc.as_smi());
+                    let idx = self.read_byte(&call_stack, fi) as usize;
+                    call_stack.frames[fi].pc += 1;
+                    self.acc =
+                        Value::from_smi(call_stack.reg(fi, idx).as_smi() / self.acc.as_smi());
                 }
                 ByteCode::Call => {
-                    let func_reg = self.read_byte(&stack, fi) as usize;
-                    stack[fi].ip += 1;
-                    let arg_end = self.read_byte(&stack, fi) as usize;
-                    stack[fi].ip += 1;
+                    let func_reg = self.read_byte(&call_stack, fi) as usize;
+                    call_stack.frames[fi].pc += 1;
+                    let arg_end = self.read_byte(&call_stack, fi) as usize;
+                    call_stack.frames[fi].pc += 1;
 
-                    let closure_val = stack[fi].reg[func_reg];
-                    let param_count = {
+                    let closure_val = call_stack.reg(fi, func_reg);
+                    let (param_count, callee_reg_count) = {
                         let c = self.heap.read_closure(closure_val);
-                        self.heap.read_function(c.function).param_count
+                        let f = self.heap.read_function(c.function);
+                        (f.param_count, f.register_count)
                     };
 
-                    let mut regs = [Value::default(); 256];
+                    let callee_base = call_stack.slots.len();
+                    call_stack
+                        .slots
+                        .resize(callee_base + callee_reg_count, Value::default());
                     for i in 0..param_count {
-                        regs[i] = stack[fi].reg[arg_end - param_count + i];
+                        call_stack.slots[callee_base + i] =
+                            call_stack.reg(fi, arg_end - param_count + i);
                     }
-                    stack.push(Frame {
-                        ip: 0,
-                        reg: regs,
+                    call_stack.frames.push(Frame {
+                        base_offset: callee_base,
+                        pc: 0,
                         closure: closure_val,
                     });
                 }
                 ByteCode::Return => {
-                    stack.pop();
+                    call_stack.pop_frame();
                 }
                 ByteCode::Push => {
-                    stack[fi].ip += 1;
+                    call_stack.frames[fi].pc += 1;
                 }
                 ByteCode::TestEqual => {
-                    let idx = self.read_byte(&stack, fi) as usize;
-                    stack[fi].ip += 1;
+                    let idx = self.read_byte(&call_stack, fi) as usize;
+                    call_stack.frames[fi].pc += 1;
                     if self.acc.is_smi() {
-                        self.acc = if self.acc.as_smi() == stack[fi].reg[idx].as_smi() {
-                            Value::from_smi(1)
-                        } else {
-                            Value::from_smi(0)
-                        };
+                        self.acc =
+                            if self.acc.as_smi() == call_stack.reg(fi, idx).as_smi() {
+                                Value::from_smi(1)
+                            } else {
+                                Value::from_smi(0)
+                            };
                     } else {
                         let a = self.heap.read_string(self.acc);
-                        let b = self.heap.read_string(stack[fi].reg[idx]);
+                        let b = self.heap.read_string(call_stack.reg(fi, idx));
                         self.acc = if a == b {
                             Value::from_smi(1)
                         } else {
@@ -199,65 +257,65 @@ impl Isolate {
                     }
                 }
                 ByteCode::TestLess => {
-                    let idx = self.read_byte(&stack, fi) as usize;
-                    stack[fi].ip += 1;
-                    self.acc = if self.acc.as_smi() > stack[fi].reg[idx].as_smi() {
+                    let idx = self.read_byte(&call_stack, fi) as usize;
+                    call_stack.frames[fi].pc += 1;
+                    self.acc = if self.acc.as_smi() > call_stack.reg(fi, idx).as_smi() {
                         Value::from_smi(1)
                     } else {
                         Value::from_smi(0)
                     };
                 }
                 ByteCode::TestGreater => {
-                    let idx = self.read_byte(&stack, fi) as usize;
-                    stack[fi].ip += 1;
-                    self.acc = if self.acc.as_smi() < stack[fi].reg[idx].as_smi() {
+                    let idx = self.read_byte(&call_stack, fi) as usize;
+                    call_stack.frames[fi].pc += 1;
+                    self.acc = if self.acc.as_smi() < call_stack.reg(fi, idx).as_smi() {
                         Value::from_smi(1)
                     } else {
                         Value::from_smi(0)
                     };
                 }
                 ByteCode::TestLessEqual => {
-                    let idx = self.read_byte(&stack, fi) as usize;
-                    stack[fi].ip += 1;
-                    self.acc = if self.acc.as_smi() >= stack[fi].reg[idx].as_smi() {
+                    let idx = self.read_byte(&call_stack, fi) as usize;
+                    call_stack.frames[fi].pc += 1;
+                    self.acc = if self.acc.as_smi() >= call_stack.reg(fi, idx).as_smi() {
                         Value::from_smi(1)
                     } else {
                         Value::from_smi(0)
                     };
                 }
                 ByteCode::TestGreaterEqual => {
-                    let idx = self.read_byte(&stack, fi) as usize;
-                    stack[fi].ip += 1;
-                    self.acc = if self.acc.as_smi() <= stack[fi].reg[idx].as_smi() {
+                    let idx = self.read_byte(&call_stack, fi) as usize;
+                    call_stack.frames[fi].pc += 1;
+                    self.acc = if self.acc.as_smi() <= call_stack.reg(fi, idx).as_smi() {
                         Value::from_smi(1)
                     } else {
                         Value::from_smi(0)
                     };
                 }
                 ByteCode::TestNotEqual => {
-                    let idx = self.read_byte(&stack, fi) as usize;
-                    stack[fi].ip += 1;
-                    self.acc = if self.acc != stack[fi].reg[idx] {
+                    let idx = self.read_byte(&call_stack, fi) as usize;
+                    call_stack.frames[fi].pc += 1;
+                    self.acc = if self.acc != call_stack.reg(fi, idx) {
                         Value::from_smi(1)
                     } else {
                         Value::from_smi(0)
                     };
                 }
                 ByteCode::LogicalAnd => {
-                    let idx = self.read_byte(&stack, fi) as usize;
-                    stack[fi].ip += 1;
+                    let idx = self.read_byte(&call_stack, fi) as usize;
+                    call_stack.frames[fi].pc += 1;
                     let zero = Value::from_smi(0);
-                    self.acc = if self.acc != zero && stack[fi].reg[idx] != zero {
+                    self.acc = if self.acc != zero && call_stack.reg(fi, idx) != zero {
                         Value::from_smi(1)
                     } else {
                         Value::from_smi(0)
                     };
                 }
                 ByteCode::LogicalOr => {
-                    let idx = self.read_byte(&stack, fi) as usize;
-                    stack[fi].ip += 1;
+                    let idx = self.read_byte(&call_stack, fi) as usize;
+                    call_stack.frames[fi].pc += 1;
                     let zero = Value::from_smi(0);
-                    self.acc = if self.acc != zero || stack[fi].reg[idx] != zero {
+                    self.acc = if self.acc != zero || call_stack.reg(fi, idx) != zero {
                         Value::from_smi(1)
                     } else {
                         Value::from_smi(0)
@@ -271,14 +329,14 @@ impl Isolate {
                     };
                 }
                 ByteCode::Jump => {
-                    let offset = self.read_byte(&stack, fi);
-                    stack[fi].ip += offset as usize + 1;
+                    let offset = self.read_byte(&call_stack, fi);
+                    call_stack.frames[fi].pc += offset as usize + 1;
                 }
                 ByteCode::JumpIfFalse => {
-                    let offset = self.read_byte(&stack, fi);
-                    stack[fi].ip += 1;
+                    let offset = self.read_byte(&call_stack, fi);
+                    call_stack.frames[fi].pc += 1;
                     if self.acc == Value::from_smi(0) {
-                        stack[fi].ip += offset as usize;
+                        call_stack.frames[fi].pc += offset as usize;
                     }
                 }
             }
@@ -287,15 +345,15 @@ impl Isolate {
         self.acc
     }
 
-    fn collect_garbage(&mut self, stack: &[Frame]) {
+    fn collect_garbage(&mut self, call_stack: &CallStack) {
         let mut roots = Vec::new();
         roots.push(self.acc);
-        for frame in stack.iter() {
+        for frame in &call_stack.frames {
             roots.push(frame.closure);
-            for &val in frame.reg.iter() {
-                if val.is_heap_object() {
-                    roots.push(val);
-                }
+        }
+        for &val in &call_stack.slots {
+            if val.is_heap_object() {
+                roots.push(val);
             }
         }
         self.heap.collect(&roots);
@@ -306,16 +364,21 @@ impl Isolate {
 mod tests {
     use super::*;
     use crate::bytecode::ByteCode;
-    use crate::heap::{BytecodeFunction, HeapClosure};
+    use crate::heap::{BytecodeFunction, Closure};
 
-    fn make_closure(heap: &mut Heap, code: Vec<u8>, cons: Vec<Value>, param_count: usize) -> Value {
+    fn make_closure(
+        heap: &mut Heap,
+        code: Vec<u8>,
+        constant_pool: Vec<Value>,
+        param_count: usize,
+    ) -> Value {
         let func = heap.alloc(HeapObject::Function(BytecodeFunction {
             code,
-            cons,
+            constant_pool,
             param_count,
-            reg_count: 0,
+            register_count: 16,
         }));
-        heap.alloc(HeapObject::Closure(HeapClosure {
+        heap.alloc(HeapObject::Closure(Closure {
             function: func,
             upvalues: vec![],
         }))
@@ -777,9 +840,9 @@ mod tests {
         let mut heap = Heap::new();
         let func = heap.alloc(HeapObject::Function(BytecodeFunction {
             code: vec![],
-            cons: vec![],
+            constant_pool: vec![],
             param_count: 0,
-            reg_count: 0,
+            register_count: 0,
         }));
         let iso = Isolate::with_heap(heap, 1024);
         assert_eq!(iso.format_value(func), "<function>");
@@ -813,15 +876,15 @@ mod tests {
         let mut heap = Heap::new();
         let func = heap.alloc(HeapObject::Function(BytecodeFunction {
             code: vec![ByteCode::Return as u8],
-            cons: vec![],
+            constant_pool: vec![],
             param_count: 0,
-            reg_count: 0,
+            register_count: 0,
         }));
-        let closure_a = heap.alloc(HeapObject::Closure(HeapClosure {
+        let closure_a = heap.alloc(HeapObject::Closure(Closure {
             function: func,
             upvalues: vec![],
         }));
-        let closure_b = heap.alloc(HeapObject::Closure(HeapClosure {
+        let closure_b = heap.alloc(HeapObject::Closure(Closure {
             function: func,
             upvalues: vec![],
         }));
