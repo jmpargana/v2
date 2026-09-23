@@ -94,6 +94,7 @@ pub struct Compiler {
     pub param_count: usize,
     pub next_reg: usize,
     pub symbols: HashMap<String, usize>,
+    pub closures: HashMap<String, Value>,
 }
 
 impl Compiler {
@@ -104,6 +105,7 @@ impl Compiler {
             param_count: 0,
             next_reg: 0,
             symbols: HashMap::new(),
+            closures: HashMap::new(),
         }
     }
 
@@ -142,14 +144,17 @@ impl Compiler {
                 self.code.push(reg as u8);
             }
             Stmt::FuncDecl { name, params, body } => {
-                let mut child = Compiler::init();
-                child.param_count = params.len();
-                for param in params {
-                    let reg = child.alloc_reg();
-                    child.symbols.insert(param.clone(), reg);
-                }
-                child.compile_stmts(body, heap);
-                let closure_val = child.finalize(heap);
+                // Two-phase allocation: create placeholder so recursive/sibling calls work
+                let placeholder_func = heap.alloc(HeapObject::Function(BytecodeFunction {
+                    code: vec![],
+                    cons: vec![],
+                    param_count: params.len(),
+                    reg_count: 0,
+                }));
+                let closure_val = heap.alloc(HeapObject::Closure(HeapClosure {
+                    function: placeholder_func,
+                    upvalues: vec![],
+                }));
 
                 let cons_idx = self.cons.len();
                 self.cons.push(closure_val);
@@ -159,6 +164,43 @@ impl Compiler {
                 self.symbols.insert(name.clone(), reg);
                 self.code.push(ByteCode::Star as u8);
                 self.code.push(reg as u8);
+                self.closures.insert(name.clone(), closure_val);
+
+                let mut child = Compiler::init();
+                child.param_count = params.len();
+                for param in params {
+                    let r = child.alloc_reg();
+                    child.symbols.insert(param.clone(), r);
+                }
+
+                // Inject parent-scope closures for recursive and cross-scope calls
+                child.closures = self.closures.clone();
+                let mut parent_closures: Vec<(String, Value)> = self
+                    .closures
+                    .iter()
+                    .map(|(n, v)| (n.clone(), *v))
+                    .collect();
+                parent_closures.sort_by(|a, b| a.0.cmp(&b.0));
+                for (fn_name, fn_val) in &parent_closures {
+                    let cidx = child.cons.len();
+                    child.cons.push(*fn_val);
+                    child.code.push(ByteCode::LdaSmi as u8);
+                    child.code.push(cidx as u8);
+                    let creg = child.alloc_reg();
+                    child.symbols.insert(fn_name.clone(), creg);
+                    child.code.push(ByteCode::Star as u8);
+                    child.code.push(creg as u8);
+                }
+
+                child.compile_stmts(body, heap);
+
+                let real_func = heap.alloc(HeapObject::Function(BytecodeFunction {
+                    code: child.code,
+                    cons: child.cons,
+                    param_count: child.param_count,
+                    reg_count: child.next_reg,
+                }));
+                heap.patch_closure(closure_val, real_func);
             }
             Stmt::Return(value) => {
                 self.compile_expr(value, heap);
@@ -482,13 +524,19 @@ mod tests {
         assert_eq!(
             child_func.code,
             vec![
-                ByteCode::Ldar as u8, 0,
+                // preamble: inject parent closure "add" into r2
+                ByteCode::LdaSmi as u8, 0,
                 ByteCode::Star as u8, 2,
+                // body: return a + b
+                ByteCode::Ldar as u8, 0,
+                ByteCode::Star as u8, 3,
                 ByteCode::Ldar as u8, 1,
-                ByteCode::Add as u8, 2,
+                ByteCode::Add as u8, 3,
                 ByteCode::Return as u8,
             ]
         );
+        assert_eq!(child_func.cons.len(), 1);
+        assert!(child_func.cons[0].is_heap_object());
     }
 
     #[test]

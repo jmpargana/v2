@@ -113,6 +113,17 @@ impl Heap {
         }
     }
 
+    pub fn get(&self, val: Value) -> Option<&HeapObject> {
+        self.objects.get(val.heap_offset())?.as_ref()
+    }
+
+    pub fn patch_closure(&mut self, closure_val: Value, new_func: Value) {
+        match &mut self.objects[closure_val.heap_offset()] {
+            Some(HeapObject::Closure(c)) => c.function = new_func,
+            other => panic!("expected Closure to patch, got {:?}", other),
+        }
+    }
+
     pub fn is_over_threshold(&self, threshold: usize) -> bool {
         self.objects.len() >= threshold
     }

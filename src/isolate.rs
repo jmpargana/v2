@@ -21,7 +21,12 @@ pub struct Isolate {
 
 impl fmt::Display for Isolate {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Isolate{{acc: {}}}", self.acc)
+        write!(
+            f,
+            "Isolate{{ acc: {}, heap_size: {} }}",
+            self.format_value(self.acc),
+            self.heap.len()
+        )
     }
 }
 
@@ -55,7 +60,12 @@ impl Isolate {
         if val.is_smi() {
             val.as_smi().to_string()
         } else {
-            self.heap.read_string(val).to_string()
+            match self.heap.get(val) {
+                Some(HeapObject::String(s)) => s.data.clone(),
+                Some(HeapObject::Closure(_)) => "<closure>".to_string(),
+                Some(HeapObject::Function(_)) => "<function>".to_string(),
+                None => "<freed>".to_string(),
+            }
         }
     }
 
@@ -677,5 +687,146 @@ mod tests {
         iso_b.eval("let x = 99;");
         assert_eq!(iso_a.format_value(iso_a.acc), "30");
         assert_eq!(iso_b.format_value(iso_b.acc), "99");
+    }
+
+    #[test]
+    fn eval_recursive_factorial() {
+        let mut iso = Isolate::new();
+        let result = iso.eval(
+            "function factorial(n) { if (n < 1) { return 1; } return n * factorial(n - 1); } factorial(10);",
+        );
+        assert_eq!(iso.format_value(result), "3628800");
+    }
+
+    #[test]
+    fn eval_recursive_fibonacci() {
+        let mut iso = Isolate::new();
+        let result = iso.eval(
+            "function fib(n) { if (n < 2) { return n; } return fib(n - 1) + fib(n - 2); } fib(10);",
+        );
+        assert_eq!(iso.format_value(result), "55");
+    }
+
+    #[test]
+    fn eval_nested_function_calls() {
+        let mut iso = Isolate::new();
+        let result = iso.eval(
+            "function square(x) { return x * x; } \
+             function sum_of_squares(a, b) { return square(a) + square(b); } \
+             sum_of_squares(3, 4);",
+        );
+        assert_eq!(iso.format_value(result), "25");
+    }
+
+    #[test]
+    fn eval_three_level_nested_calls() {
+        let mut iso = Isolate::new();
+        let result = iso.eval(
+            "function square(x) { return x * x; } \
+             function sum_of_squares(a, b) { return square(a) + square(b); } \
+             function hypotenuse_squared(a, b) { return sum_of_squares(a, b); } \
+             hypotenuse_squared(3, 4);",
+        );
+        assert_eq!(iso.format_value(result), "25");
+    }
+
+    #[test]
+    fn eval_conditional_chain() {
+        let mut iso = Isolate::new();
+        let result = iso.eval(
+            "function classify(n) { \
+               if (n > 100) { return 3; } \
+               if (n > 10) { return 2; } \
+               if (n > 0) { return 1; } \
+               return 0; \
+             } \
+             let a = classify(200); \
+             let b = classify(50); \
+             let c = classify(5); \
+             let d = classify(0); \
+             a * 1000 + b * 100 + c * 10 + d;",
+        );
+        assert_eq!(iso.format_value(result), "3210");
+    }
+
+    #[test]
+    fn eval_max_clamp() {
+        let mut iso = Isolate::new();
+        let result = iso.eval(
+            "function max(a, b) { if (a > b) { return a; } else { return b; } } \
+             function clamp(val, lo, hi) { \
+               if (val < lo) { return lo; } \
+               if (val > hi) { return hi; } \
+               return val; \
+             } \
+             max(clamp(500, 0, 100), clamp(30, 0, 100));",
+        );
+        assert_eq!(iso.format_value(result), "100");
+    }
+
+    #[test]
+    fn format_value_closure() {
+        let mut heap = Heap::new();
+        let closure = make_closure(&mut heap, vec![], vec![], 0);
+        let iso = Isolate::with_heap(heap, 1024);
+        assert_eq!(iso.format_value(closure), "<closure>");
+    }
+
+    #[test]
+    fn format_value_function() {
+        let mut heap = Heap::new();
+        let func = heap.alloc(HeapObject::Function(BytecodeFunction {
+            code: vec![],
+            cons: vec![],
+            param_count: 0,
+            reg_count: 0,
+        }));
+        let iso = Isolate::with_heap(heap, 1024);
+        assert_eq!(iso.format_value(func), "<function>");
+    }
+
+    #[test]
+    fn display_isolate() {
+        let mut iso = Isolate::new();
+        iso.eval("let x = 42;");
+        let display = format!("{}", iso);
+        assert!(display.contains("42"));
+        assert!(display.contains("heap_size"));
+    }
+
+    #[test]
+    fn gc_preserves_closures_during_execution() {
+        let mut iso = Isolate::new();
+        iso.gc_threshold = 8;
+        let result = iso.eval(
+            "function add(a, b) { return a + b; } \
+             let x = add(1, 2); \
+             let y = add(3, 4); \
+             let z = add(5, 6); \
+             x + y + z;",
+        );
+        assert_eq!(iso.format_value(result), "21");
+    }
+
+    #[test]
+    fn closure_shares_function() {
+        let mut heap = Heap::new();
+        let func = heap.alloc(HeapObject::Function(BytecodeFunction {
+            code: vec![ByteCode::Return as u8],
+            cons: vec![],
+            param_count: 0,
+            reg_count: 0,
+        }));
+        let closure_a = heap.alloc(HeapObject::Closure(HeapClosure {
+            function: func,
+            upvalues: vec![],
+        }));
+        let closure_b = heap.alloc(HeapObject::Closure(HeapClosure {
+            function: func,
+            upvalues: vec![],
+        }));
+        let func_a = heap.read_closure(closure_a).function;
+        let func_b = heap.read_closure(closure_b).function;
+        assert_eq!(func_a, func_b);
     }
 }
