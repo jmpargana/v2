@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Cached Frame Pointers: Eliminating Per-Instruction Heap Lookups</title>
+<style>
+  :root {
+    --bg: #1a1b26;
+    --fg: #c0caf5;
+    --accent: #7aa2f7;
+    --muted: #565f89;
+    --surface: #24283b;
+    --border: #3b4261;
+    --code-bg: #1f2335;
+    --green: #9ece6a;
+    --red: #f7768e;
+    --yellow: #e0af68;
+    --bold: #e0e0e0;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    background: var(--bg);
+    color: var(--fg);
+    line-height: 1.7;
+    max-width: 52rem;
+    margin: 0 auto;
+    padding: 3rem 2rem 6rem;
+  }
+  h1 {
+    color: var(--accent);
+    font-size: 1.8rem;
+    margin-bottom: 0.5rem;
+    letter-spacing: -0.02em;
+  }
+  h1 + p { color: var(--muted); margin-bottom: 2.5rem; }
+  h2 {
+    color: var(--bold);
+    font-size: 1.25rem;
+    margin-top: 3rem;
+    margin-bottom: 1rem;
+    padding-bottom: 0.4rem;
+    border-bottom: 1px solid var(--border);
+  }
+  p { margin-bottom: 1rem; }
+  strong { color: var(--bold); }
+  code {
+    font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+    font-size: 0.88em;
+    background: var(--code-bg);
+    padding: 0.15em 0.4em;
+    border-radius: 4px;
+    color: var(--green);
+  }
+  pre {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1.2rem 1.4rem;
+    margin: 1rem 0 1.5rem;
+    overflow-x: auto;
+    line-height: 1.5;
+  }
+  pre code {
+    background: none;
+    padding: 0;
+    font-size: 0.85em;
+    color: var(--fg);
+  }
+  .comment { color: var(--muted); }
+  .keyword { color: var(--accent); }
+  .string { color: var(--green); }
+  .number { color: var(--yellow); }
+  .arrow { color: var(--red); }
+  hr {
+    border: none;
+    border-top: 1px solid var(--border);
+    margin: 2.5rem 0;
+  }
+  ol, ul { margin: 0.5rem 0 1rem 1.5rem; }
+  li { margin-bottom: 0.3rem; }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 1rem 0 1.5rem;
+    font-size: 0.92em;
+  }
+  th {
+    text-align: left;
+    color: var(--accent);
+    border-bottom: 2px solid var(--border);
+    padding: 0.6rem 1rem;
+  }
+  td {
+    border-bottom: 1px solid var(--border);
+    padding: 0.5rem 1rem;
+  }
+  tr:last-child td { border-bottom: none; }
+  .diagram {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1.2rem 1.4rem;
+    margin: 1rem 0 1.5rem;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.82em;
+    line-height: 1.4;
+    white-space: pre;
+    overflow-x: auto;
+    color: var(--muted);
+  }
+  .diagram .highlight { color: var(--accent); }
+  .diagram .arrow { color: var(--red); }
+  .diagram .label { color: var(--green); }
+</style>
+</head>
+<body>
+
+<h1>Cached Frame Pointers</h1>
+<p>Eliminating per-instruction heap lookups in the bytecode dispatch loop</p>
+
+<h2>The problem: redundant indirection in the hot loop</h2>
+
+<p>Before this change, reading a single byte of bytecode required two heap lookups:</p>
+
+<pre><code><span class="comment">// OLD &mdash; called on EVERY instruction dispatch</span>
+<span class="keyword">fn</span> read_byte(&amp;self, call_stack: &amp;CallStack, fi: usize) -&gt; u8 {
+    <span class="keyword">let</span> closure = self.heap.read_closure(call_stack.frames[fi].closure);  <span class="comment">// lookup 1</span>
+    <span class="keyword">let</span> func = self.heap.read_function(closure.function);                 <span class="comment">// lookup 2</span>
+    func.code[call_stack.frames[fi].pc]
+}</code></pre>
+
+<p>Each <code>read_closure</code> and <code>read_function</code> indexes into <code>heap.objects: Vec&lt;Option&lt;HeapObject&gt;&gt;</code>, pattern-matches the enum variant, and returns a reference. Per instruction, the loop called this pattern 2&ndash;3 times:</p>
+
+<ol>
+  <li>Once to check <code>code_len</code> (end-of-function guard)</li>
+  <li>Once for the opcode byte</li>
+  <li>Once (or more) for operand bytes and constant pool lookups</li>
+</ol>
+
+<p>That&rsquo;s <strong>4&ndash;6 heap indirections per bytecode instruction</strong>, all to reach data that doesn&rsquo;t change within a frame &mdash; the closure and function are fixed from <code>Call</code> to <code>Return</code>.</p>
+
+<hr>
+
+<h2>The fix: cache raw pointers at frame entry</h2>
+
+<p>The <code>Frame</code> struct now caches <code>*const u8</code> and <code>*const Value</code> pointing directly into the function&rsquo;s <code>code</code> and <code>constant_pool</code> buffers:</p>
+
+<pre><code><span class="keyword">struct</span> Frame {
+    base_offset: usize,
+    pc: usize,
+    closure: Value,
+    code: *<span class="keyword">const</span> u8,        <span class="comment">// points into BytecodeFunction.code's heap buffer</span>
+    code_len: usize,
+    constants: *<span class="keyword">const</span> Value, <span class="comment">// points into BytecodeFunction.constant_pool's heap buffer</span>
+    constants_len: usize,
+}</code></pre>
+
+<p>These are computed once when the frame is created (<code>Frame::new</code>), and all bytecode reads go through them:</p>
+
+<pre><code><span class="keyword">impl</span> Frame {
+    <span class="keyword">fn</span> new(heap: &amp;Heap, closure: Value, base_offset: usize) -&gt; Self {
+        <span class="keyword">let</span> c = heap.read_closure(closure);
+        <span class="keyword">let</span> f = heap.read_function(c.function);
+        Frame {
+            base_offset,
+            pc: <span class="number">0</span>,
+            closure,
+            code: f.code.as_ptr(),
+            code_len: f.code.len(),
+            constants: f.constant_pool.as_ptr(),
+            constants_len: f.constant_pool.len(),
+        }
+    }
+
+    <span class="keyword">fn</span> read_byte(&amp;self) -&gt; u8 {
+        assert!(self.pc &lt; self.code_len);
+        <span class="keyword">unsafe</span> { *self.code.add(self.pc) }
+    }
+
+    <span class="keyword">fn</span> read_constant(&amp;self, idx: usize) -&gt; Value {
+        assert!(idx &lt; self.constants_len);
+        <span class="keyword">unsafe</span> { *self.constants.add(idx) }
+    }
+}</code></pre>
+
+<p>The dispatch loop now reads:</p>
+
+<pre><code><span class="comment">// NEW &mdash; zero heap lookups per instruction</span>
+<span class="keyword">let</span> opcode = ByteCode::from(call_stack.frames[fi].read_byte());</code></pre>
+
+<p>Instead of:</p>
+
+<pre><code><span class="comment">// OLD &mdash; two heap lookups per call</span>
+<span class="keyword">let</span> opcode = ByteCode::from(self.read_byte(&amp;call_stack, fi));</code></pre>
+
+<hr>
+
+<h2>Why this is safe (the <code>unsafe</code> contract)</h2>
+
+<p>The raw pointers dereference memory owned by <code>Vec&lt;u8&gt;</code> and <code>Vec&lt;Value&gt;</code> inside a <code>BytecodeFunction</code> on the heap. Three properties keep the pointers valid:</p>
+
+<p><strong>1. Moving a <code>Vec</code> struct doesn&rsquo;t move its buffer.</strong><br>
+<code>Vec&lt;u8&gt;</code> is a <code>(pointer, length, capacity)</code> triple. The actual data lives in a separate heap allocation. When the <code>heap.objects</code> Vec reallocates (on <code>alloc</code>), it moves the <code>Option&lt;HeapObject&gt;</code> structs &mdash; including the <code>BytecodeFunction</code> and its <code>Vec&lt;u8&gt;</code> field &mdash; but the <code>Vec&lt;u8&gt;</code>&rsquo;s <em>buffer</em> stays at the same address. Our raw pointer targets the buffer, not the struct.</p>
+
+<div class="diagram"><span class="highlight">heap.objects Vec:</span>
+  ┌──────────────────────┐         <span class="label">heap buffer (stable):</span>
+  │ Some(Function {      │         ┌──────────────────┐
+  │   code: Vec {        │<span class="arrow">────────&gt;</span>│ LdaSmi, 0, Star, │ <span class="arrow">&lt;──</span> <span class="label">code ptr</span>
+  │     ptr <span class="arrow">─────────────</span>│         │ 0, LdaSmi, 1 ... │
+  │     len: 14          │         └──────────────────┘
+  │     cap: 16          │
+  │   }                  │
+  │ })                   │
+  └──────────────────────┘
+         ↑
+  <span class="highlight">This part moves on realloc.</span>
+  <span class="label">The buffer (right) does not.</span></div>
+
+<p><strong>2. Nothing mutates the code or constant_pool during execution.</strong><br>
+The bytecode is compiled before <code>run()</code> is called. No instruction handler appends to, shrinks, or reallocates <code>code</code> or <code>constant_pool</code>. The Vecs are effectively frozen.</p>
+
+<p><strong>3. GC won&rsquo;t collect the function.</strong><br>
+Each <code>Frame</code> stores its <code>closure</code> as a <code>Value</code>. The GC roots include all frame closures. The closure references the function. Therefore the function is always reachable, and <code>collect()</code> will never set it to <code>None</code> (which would drop the Vec and free the buffer).</p>
+
+<hr>
+
+<h2>What changed in the dispatch loop</h2>
+
+<p>The three old helper methods on <code>Isolate</code> were deleted:</p>
+
+<pre><code><span class="comment">// DELETED</span>
+<span class="keyword">fn</span> read_byte(&amp;self, call_stack: &amp;CallStack, fi: usize) -&gt; u8 { ... }
+<span class="keyword">fn</span> code_len(&amp;self, call_stack: &amp;CallStack, fi: usize) -&gt; usize { ... }
+<span class="keyword">fn</span> read_constant(&amp;self, call_stack: &amp;CallStack, fi: usize, idx: usize) -&gt; Value { ... }</code></pre>
+
+<p>Their functionality moved to <code>Frame::read_byte()</code>, <code>Frame.code_len</code>, and <code>Frame::read_constant()</code>.</p>
+
+<p>Every call site in the <code>run()</code> match arms was updated mechanically:</p>
+
+<table>
+  <tr><th>Before</th><th>After</th></tr>
+  <tr><td><code>self.read_byte(&amp;call_stack, fi)</code></td><td><code>call_stack.frames[fi].read_byte()</code></td></tr>
+  <tr><td><code>self.code_len(&amp;call_stack, fi)</code></td><td><code>call_stack.frames[fi].code_len</code></td></tr>
+  <tr><td><code>self.read_constant(&amp;call_stack, fi, idx)</code></td><td><code>call_stack.frames[fi].read_constant(idx)</code></td></tr>
+</table>
+
+<p>The <code>Call</code> handler now creates frames via <code>Frame::new(&amp;self.heap, ...)</code> instead of a struct literal, which is where the pointer caching happens.</p>
+
+<hr>
+
+<h2>Cost model: before vs. after</h2>
+
+<table>
+  <tr><th>Operation</th><th>Before</th><th>After</th></tr>
+  <tr><td>Read one opcode byte</td><td>2 heap lookups + array index</td><td>1 pointer deref</td></tr>
+  <tr><td>Read one operand byte</td><td>2 heap lookups + array index</td><td>1 pointer deref</td></tr>
+  <tr><td>Read one constant</td><td>2 heap lookups + array index</td><td>1 pointer deref</td></tr>
+  <tr><td>End-of-code check</td><td>2 heap lookups + <code>.len()</code></td><td>field comparison</td></tr>
+  <tr><td>Function call (frame push)</td><td>struct literal</td><td>2 heap lookups (once) + cache pointers</td></tr>
+  <tr><td>Frame pop</td><td>unchanged</td><td>unchanged</td></tr>
+</table>
+
+<p>For a typical instruction like <code>LdaSmi 0</code> (opcode + operand + constant read), the old code did <strong>6 heap lookups</strong>. The new code does <strong>3 pointer derefs</strong> plus a field read &mdash; and those pointer derefs inline to single <code>mov</code> instructions.</p>
+
+<p>The cost is paid once per <code>Call</code> instead of per instruction. For <code>factorial(10)</code> executing ~60 instructions across 11 frames, that&rsquo;s ~360 heap lookups eliminated, replaced by 11 <code>Frame::new</code> calls (22 lookups total).</p>
+
+<hr>
+
+<h2>Why not just use references?</h2>
+
+<p>The natural Rust approach would be to cache <code>&amp;[u8]</code> and <code>&amp;[Value]</code> slices:</p>
+
+<pre><code><span class="keyword">struct</span> Frame&lt;<span class="string">'a</span>&gt; {
+    code: &amp;<span class="string">'a</span> [u8],
+    constants: &amp;<span class="string">'a</span> [Value],
+    <span class="comment">// ...</span>
+}</code></pre>
+
+<p>This doesn&rsquo;t work because the <code>Add</code> (string concatenation) handler calls <code>self.heap.alloc_string()</code>, which borrows <code>self.heap</code> mutably. If <code>Frame</code> holds an immutable borrow into the heap, you get:</p>
+
+<pre><code><span class="arrow">error[E0502]</span>: cannot borrow `self.heap` as mutable because it is also borrowed as immutable</code></pre>
+
+<p>The borrow checker can&rsquo;t see that the slice points into a <em>different</em> allocation than the one <code>alloc_string</code> might reallocate. Raw pointers sidestep this &mdash; they&rsquo;re not borrows, so they don&rsquo;t participate in the borrow checker&rsquo;s analysis.</p>
+
+<p>This is the standard Rust pattern for self-referential performance caches: use raw pointers when you can prove stability but the borrow checker can&rsquo;t.</p>
+
+<hr>
+
+<h2>Alternatives considered</h2>
+
+<p><strong>Re-borrow per iteration:</strong> Decode the full instruction (opcode + operands) in one block holding the immutable borrow, then drop it before executing. Halves the lookups with no <code>unsafe</code>, but still does 2 lookups per instruction instead of 0.</p>
+
+<p><strong>Move bytecode out of the GC heap:</strong> Store <code>BytecodeFunction</code> in a separate <code>Vec&lt;BytecodeFunction&gt;</code> arena on the <code>Isolate</code>, indexed by <code>FunctionId(usize)</code>. Since it&rsquo;s a separate field from <code>heap</code>, the borrow checker allows <code>&amp;self.functions[id]</code> and <code>&amp;mut self.heap</code> simultaneously. Architecturally cleanest &mdash; no <code>unsafe</code> needed &mdash; but a larger refactor that changes how the compiler, heap, and GC interact.</p>
+
+</body>
+</html>
