@@ -1,0 +1,748 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Lesson 11: While Loops &amp; Variable Reassignment</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<h1>While Loops &amp; Variable Reassignment</h1>
+<p class="lesson-meta">
+  Lesson 11 &middot; ~30 min &middot;
+  Prev: <a href="0010-closures-functions-on-the-heap.html">Lesson 10</a> &middot;
+  Reference: <a href="../reference/bytecode-instruction-set.html">Instruction Set</a>
+</p>
+
+<p>
+  Your VM can branch with <code>if</code>/<code>else</code>, but it can&rsquo;t loop.
+  The jump instructions from Lesson&nbsp;6 only move <code>pc</code> <em>forward</em> &mdash;
+  they skip over code. A loop needs to go <em>backward</em> to re-test its condition.
+  This lesson adds one new bytecode (<code>JumpLoop</code>), one new statement type
+  (<code>while</code>), and variable reassignment (<code>x = x + 1</code>) &mdash; because
+  a loop without mutation runs forever or not at all.
+</p>
+
+<h2>The Problem: Forward-Only Jumps</h2>
+
+<p>
+  Look at the current <code>Jump</code> handler:
+</p>
+
+<pre><code>ByteCode::Jump => {
+    let offset = self.read_byte(&call_stack, fi);
+    call_stack.frames[fi].pc += offset as usize + 1;  // always adds
+}</code></pre>
+
+<p>
+  This <em>always adds</em> to <code>pc</code>. There is no way to subtract.
+  An <code>if</code> statement only needs forward jumps &mdash; it skips over the
+  then-branch or the else-branch. But a <code>while</code> loop needs the instruction
+  pointer to circle back:
+</p>
+
+<pre><code>     ┌──────────────────────────┐
+     │    condition test         │ ◄─── back edge
+     │    JumpIfFalse ──────────┼──► exit
+     │    body...                │
+     │    JumpLoop ─────────────┘
+     │
+     ▼ (exit)
+     next statement</code></pre>
+
+<p>
+  The jump from the bottom of the body back to the condition is called the
+  <strong>back edge</strong>. In V8&rsquo;s Ignition interpreter, this is the
+  <code>JumpLoop</code> bytecode &mdash; the <em>only</em> instruction that moves
+  <code>pc</code> backward.
+</p>
+
+<div class="quiz" data-correct="2"
+     data-right="Correct. Jump and JumpIfFalse only add to pc, so they can only skip forward. A loop must revisit earlier instructions, which requires subtracting from pc."
+     data-wrong="Think about what happens at the end of a loop body. The VM needs to go back to the condition — that means an earlier address. Can adding to pc get you there?">
+  <div class="quiz-question">
+    Why can&rsquo;t we implement <code>while</code> with the existing <code>Jump</code>
+    and <code>JumpIfFalse</code> instructions?
+  </div>
+  <div class="quiz-options">
+    <div class="quiz-option">Jump can only be used inside if statements</div>
+    <div class="quiz-option">JumpIfFalse doesn&rsquo;t support loop conditions</div>
+    <div class="quiz-option">Both only move pc forward &mdash; loops need backward jumps</div>
+    <div class="quiz-option">The VM doesn&rsquo;t support conditions inside loops</div>
+  </div>
+  <div class="quiz-feedback"></div>
+</div>
+
+<h2>The New Bytecode: JumpLoop</h2>
+
+<p>
+  <code>JumpLoop</code> is a backward jump. It reads an offset byte and
+  <em>subtracts</em> from <code>pc</code> instead of adding:
+</p>
+
+<pre><code>ByteCode::JumpLoop => {
+    let offset = self.read_byte(&call_stack, fi);
+    call_stack.frames[fi].pc += 1;     // advance past the operand byte
+    call_stack.frames[fi].pc -= offset as usize;  // jump backward
+}</code></pre>
+
+<p>
+  After reading the operand, <code>pc</code> points to the byte after <code>JumpLoop</code>.
+  Subtracting <code>offset</code> lands it back on the first byte of the condition.
+</p>
+
+<h3>Why not reuse Jump with signed offsets?</h3>
+
+<p>
+  You <em>could</em> make <code>Jump</code> take a signed <code>i8</code> and handle both
+  directions. V8 doesn&rsquo;t, for two reasons:
+</p>
+
+<ol>
+  <li><strong>Back edges are semantically special.</strong> They&rsquo;re where the runtime
+      checks for stack overflow, GC safe points, debugger breakpoints, and whether to
+      tier up to the optimizing compiler. A unified <code>Jump</code> would need
+      &ldquo;am I going backward?&rdquo; on every jump.</li>
+  <li><strong>Range.</strong> A <code>u8</code> offset gives 0&ndash;255 range in one
+      direction. A signed <code>i8</code> gives only &minus;128 to +127 each way. Separate
+      opcodes double the effective range.</li>
+</ol>
+
+<div class="callout">
+  <strong>V8 parallel:</strong> V8&rsquo;s <code>JumpLoop</code> takes two operands:
+  a feedback slot (for profiling how often the loop runs) and the offset. The feedback
+  slot feeds into TurboFan&rsquo;s optimization decisions. Our <code>JumpLoop</code>
+  takes just the offset &mdash; no profiling yet.
+</div>
+
+<h2>Variable Reassignment</h2>
+
+<p>
+  A loop like <code>while (x &gt; 0) { x = x - 1; }</code> needs to update <code>x</code>
+  each iteration. Currently, your VM can <em>declare</em> variables (<code>let x = 10;</code>)
+  but not <em>reassign</em> them (<code>x = 5;</code>). The parser sees
+  <code>x = ...</code> and doesn&rsquo;t know how to handle it &mdash; it&rsquo;s neither a
+  declaration (no <code>let</code>) nor an expression statement.
+</p>
+
+<h3>AST</h3>
+
+<p>Add a new statement variant:</p>
+
+<pre><code>pub enum Stmt {
+    // ... existing variants ...
+    Assign {
+        name: String,
+        value: Expr,
+    },
+}</code></pre>
+
+<h3>Parser: 1-token lookahead</h3>
+
+<p>
+  When the parser sees an identifier, it peeks at the next token. If it&rsquo;s
+  <code>=</code> (not <code>==</code>), this is an assignment:
+</p>
+
+<pre><code>fn parse_expr_stmt(&mut self) -> Stmt {
+    if self.peek() == SymbolKind::Ident {
+        if self.pos + 1 < self.syms.len()
+            && self.syms[self.pos + 1].kind == SymbolKind::Assign
+        {
+            let name = self.pop().str_val;
+            self.expect(SymbolKind::Assign);
+            let value = self.parse_expr();
+            self.expect(SymbolKind::Semi);
+            return Stmt::Assign { name, value };
+        }
+    }
+    let expr = self.parse_expr();
+    self.expect(SymbolKind::Semi);
+    Stmt::ExprStmt(expr)
+}</code></pre>
+
+<h3>Compiler: no new register needed</h3>
+
+<p>
+  This is the elegant part. <code>let x = 10;</code> allocated register <code>r0</code>
+  for <code>x</code> and stored <code>"x" &rarr; 0</code> in the symbol table. A later
+  <code>x = 5;</code> compiles the right-hand side, then stores the result back into
+  <code>r0</code> using the same mapping:
+</p>
+
+<pre><code>Stmt::Assign { name, value } => {
+    self.compile_expr(value, heap);
+    let reg = self.symbols[name];  // reuse the existing register
+    self.code.push(ByteCode::Star as u8);
+    self.code.push(reg as u8);
+}</code></pre>
+
+<p>
+  No new bytecode. No new register. It&rsquo;s just <code>Star&nbsp;rN</code> again,
+  targeting the same slot that the <code>let</code> originally created.
+</p>
+
+<div class="quiz" data-correct="1"
+     data-right="Correct! The symbol table maps 'x' to its register. Reassignment compiles the new value into the accumulator, then Star stores it back to the same register. No new allocation."
+     data-wrong="Think about what the symbol table contains after `let x = 10;`. It maps 'x' to a register number. What does `x = 5;` do with that mapping?">
+  <div class="quiz-question">
+    After <code>let x = 10;</code> places <code>x</code> in register <code>r0</code>,
+    how does <code>x = x + 1;</code> update it?
+  </div>
+  <div class="quiz-options">
+    <div class="quiz-option">Allocates a new register r1 and copies the value</div>
+    <div class="quiz-option">Compiles <code>x + 1</code>, then emits <code>Star r0</code> &mdash; same register</div>
+    <div class="quiz-option">Uses a special <code>Mutate</code> bytecode</div>
+    <div class="quiz-option">Modifies the constant pool entry for x</div>
+  </div>
+  <div class="quiz-feedback"></div>
+</div>
+
+<h2>Compiling While Loops</h2>
+
+<h3>Lexer and AST</h3>
+
+<p>
+  Add <code>While</code> to <code>SymbolKind</code> and recognize the keyword
+  <code>"while"</code> in the lexer. Add a new AST variant:
+</p>
+
+<pre><code>Stmt::While {
+    condition: Expr,
+    body: Vec&lt;Stmt&gt;,
+}</code></pre>
+
+<h3>Parser</h3>
+
+<pre><code>fn parse_while(&mut self) -> Stmt {
+    self.expect(SymbolKind::While);
+    self.expect(SymbolKind::LPar);
+    let condition = self.parse_expr();
+    self.expect(SymbolKind::RPar);
+    self.expect(SymbolKind::LBrace);
+    let mut body = Vec::new();
+    while self.peek() != SymbolKind::RBrace {
+        body.push(self.parse_stmt());
+    }
+    self.expect(SymbolKind::RBrace);
+    Stmt::While { condition, body }
+}</code></pre>
+
+<h3>Compiler: the loop compilation pattern</h3>
+
+<p>This is the core of the lesson. The compiler emits code in five steps:</p>
+
+<pre><code>Stmt::While { condition, body } => {
+    // 1. Record where the condition starts (JumpLoop target)
+    let loop_start = self.code.len();
+
+    // 2. Compile the condition (leaves 0 or 1 in acc)
+    self.compile_expr(condition, heap);
+
+    // 3. Emit JumpIfFalse with placeholder (exit the loop)
+    let exit_jump = self.emit_jump(ByteCode::JumpIfFalse);
+
+    // 4. Compile the body
+    self.compile_stmts(body, heap);
+
+    // 5. Emit JumpLoop back to loop_start
+    let offset = self.code.len() + 2 - loop_start;
+    self.code.push(ByteCode::JumpLoop as u8);
+    self.code.push(offset as u8);
+
+    // 6. Patch the exit jump to land here
+    self.patch_jump(exit_jump);
+}</code></pre>
+
+<p>
+  Steps 1&ndash;4 mirror <code>if</code> compilation exactly. Step&nbsp;5 is new: instead
+  of falling through, the compiler emits <code>JumpLoop</code> to circle back to the
+  condition. Step&nbsp;6 patches the exit jump to skip past the <code>JumpLoop</code>.
+</p>
+
+<h2>The Offset Calculation</h2>
+
+<p>
+  Getting the <code>JumpLoop</code> offset right is the hardest part of this lesson.
+  Let&rsquo;s trace through it carefully:
+</p>
+
+<pre><code>loop_start = 0          // condition starts at byte 0
+
+... condition occupies bytes 0..7 ...
+... JumpIfFalse at bytes 8,9 ...
+... body occupies bytes 10..19 ...
+
+// Now we emit JumpLoop:
+// code.len() == 20   (where the opcode goes)
+// After VM reads the operand: pc == 22
+// We want: pc - offset == loop_start == 0
+// So: offset == 22 == code.len() + 2 - loop_start
+
+self.code.push(JumpLoop);   // byte 20
+self.code.push(22);          // byte 21
+// VM: pc = 22, then pc -= 22, pc = 0  ✓</code></pre>
+
+<p>
+  The <code>+2</code> accounts for the two bytes of the <code>JumpLoop</code> instruction
+  itself (opcode + operand). If you forget it, the loop lands on byte&nbsp;2 instead of
+  byte&nbsp;0, skipping the first instruction of the condition on every iteration.
+</p>
+
+<div class="callout warn">
+  <strong>Common bug:</strong> Using <code>self.code.len() - loop_start</code> without the
+  <code>+2</code>. This makes the loop jump two bytes too late. The symptom is subtle:
+  the loop appears to work for some programs but silently skips the first comparison
+  operand, producing wrong results or infinite loops.
+</div>
+
+<div class="quiz" data-correct="0"
+     data-right="Correct. The JumpLoop opcode occupies 2 bytes (opcode + operand). After the VM reads the operand, pc is 2 past where the opcode was emitted. The offset must account for this."
+     data-wrong="Think about where pc is after the VM reads the JumpLoop instruction and its operand. It has advanced past both bytes. The offset must get from that position back to loop_start.">
+  <div class="quiz-question">
+    Why does the JumpLoop offset formula include <code>+ 2</code>?
+  </div>
+  <div class="quiz-options">
+    <div class="quiz-option">The JumpLoop instruction is 2 bytes &mdash; pc advances past both before jumping</div>
+    <div class="quiz-option">The condition always starts 2 bytes into the loop</div>
+    <div class="quiz-option">We need to skip over the JumpIfFalse instruction</div>
+    <div class="quiz-option">It compensates for the operand being unsigned</div>
+  </div>
+  <div class="quiz-feedback"></div>
+</div>
+
+<h2>Worked Example: Counting Down</h2>
+
+<p>Source:</p>
+
+<pre><code>let x = 3;
+while (x > 0) {
+    x = x - 1;
+}
+x;</code></pre>
+
+<p>Compiled bytecode:</p>
+
+<pre><code>addr  instruction        effect
+────  ─────────────────  ──────────────────────
+0000  LdaSmi [0] (3)     acc = 3
+0002  Star r0             r0 = 3  (let x = 3)
+
+                          ◄─── loop_start (addr 0004)
+0004  Ldar r0             acc = x
+0006  Star r1             r1 = x  (stash for comparison)
+0008  LdaSmi [1] (0)      acc = 0
+0010  TestGreater r1      acc = (x > 0) ? 1 : 0
+0012  JumpIfFalse 8       if acc==0, skip 8 → addr 0022
+
+0014  Ldar r0             acc = x
+0016  Star r2             r2 = x  (stash for subtraction)
+0018  LdaSmi [2] (1)      acc = 1
+0020  Sub r2              acc = x - 1
+0022  Star r0             r0 = acc  (x = x - 1)
+
+0024  JumpLoop 22         pc = 0026 - 22 = 0004  ◄── back edge
+
+0026  Ldar r0             acc = x  (final expression)
+</code></pre>
+
+<h2>Watch It Run</h2>
+
+<p>Step through the full execution. Watch how <code>x</code> decreases each iteration
+   and the JumpLoop circles back to the condition:</p>
+
+<div class="stepper" data-steps='[
+  {"label":"LdaSmi [0] — acc = 3","stack":[]},
+  {"label":"Star r0 — x = 3","stack":[]},
+  {"label":"── iteration 1 ── Ldar r0 — acc = 3","stack":[]},
+  {"label":"Star r1 — stash x=3","stack":[]},
+  {"label":"LdaSmi [1] — acc = 0","stack":[]},
+  {"label":"TestGreater r1 — (3 > 0) = 1","stack":[]},
+  {"label":"JumpIfFalse 8 — acc=1, no jump","stack":[]},
+  {"label":"Ldar r0 — acc = 3","stack":[]},
+  {"label":"Star r2 — stash 3","stack":[]},
+  {"label":"LdaSmi [2] — acc = 1","stack":[]},
+  {"label":"Sub r2 — acc = 3 - 1 = 2","stack":[]},
+  {"label":"Star r0 — x = 2","stack":[]},
+  {"label":"JumpLoop 22 — back to condition","stack":[]},
+  {"label":"── iteration 2 ── Ldar r0 — acc = 2","stack":[]},
+  {"label":"TestGreater r1 — (2 > 0) = 1","stack":[]},
+  {"label":"JumpIfFalse — no jump","stack":[]},
+  {"label":"Sub r2 — acc = 2 - 1 = 1","stack":[]},
+  {"label":"Star r0 — x = 1","stack":[]},
+  {"label":"JumpLoop 22 — back to condition","stack":[]},
+  {"label":"── iteration 3 ── Ldar r0 — acc = 1","stack":[]},
+  {"label":"TestGreater r1 — (1 > 0) = 1","stack":[]},
+  {"label":"JumpIfFalse — no jump","stack":[]},
+  {"label":"Sub r2 — acc = 1 - 1 = 0","stack":[]},
+  {"label":"Star r0 — x = 0","stack":[]},
+  {"label":"JumpLoop 22 — back to condition","stack":[]},
+  {"label":"── exit ── Ldar r0 — acc = 0","stack":[]},
+  {"label":"TestGreater r1 — (0 > 0) = 0","stack":[]},
+  {"label":"JumpIfFalse 8 — acc=0, JUMP to exit!","stack":[]},
+  {"label":"Ldar r0 — acc = 0 (final result)","stack":[]}
+]'>
+  <div class="stepper-controls">
+    <button data-prev>&larr; Prev</button>
+    <button data-next>Next &rarr;</button>
+    <span class="stepper-status">ready</span>
+  </div>
+  <div class="stepper-body">
+    <div class="stepper-instructions">
+      <div><code style="color:var(--muted)">// let x = 3;</code></div>
+      <div>LdaSmi [0]&ensp;<span style="color:var(--muted)">(3)</span></div>
+      <div>Star r0</div>
+      <div><code style="color:var(--muted)">// while (x > 0) {</code></div>
+      <div>Ldar r0</div>
+      <div>Star r1</div>
+      <div>LdaSmi [1]&ensp;<span style="color:var(--muted)">(0)</span></div>
+      <div>TestGreater r1</div>
+      <div>JumpIfFalse 8</div>
+      <div><code style="color:var(--muted)">// x = x - 1;</code></div>
+      <div>Ldar r0</div>
+      <div>Star r2</div>
+      <div>LdaSmi [2]&ensp;<span style="color:var(--muted)">(1)</span></div>
+      <div>Sub r2</div>
+      <div>Star r0</div>
+      <div>JumpLoop 22</div>
+      <div><code style="color:var(--muted)">// } (loop exit)</code></div>
+      <div>Ldar r0</div>
+    </div>
+    <div class="stepper-registers" style="min-width:160px; font-family:var(--font-mono); font-size:0.82rem;">
+      <div class="stepper-stack-label">Registers</div>
+      <div id="loop-reg-display" style="line-height:1.8;"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+document.addEventListener('DOMContentLoaded', () => {
+  const states = [
+    {acc:3,  r0:'—', r1:'—', r2:'—', iter:'init'},
+    {acc:3,  r0:3,   r1:'—', r2:'—', iter:'init'},
+    {acc:3,  r0:3,   r1:'—', r2:'—', iter:1},
+    {acc:3,  r0:3,   r1:3,   r2:'—', iter:1},
+    {acc:0,  r0:3,   r1:3,   r2:'—', iter:1},
+    {acc:1,  r0:3,   r1:3,   r2:'—', iter:1},
+    {acc:1,  r0:3,   r1:3,   r2:'—', iter:1},
+    {acc:3,  r0:3,   r1:3,   r2:'—', iter:1},
+    {acc:3,  r0:3,   r1:3,   r2:3,   iter:1},
+    {acc:1,  r0:3,   r1:3,   r2:3,   iter:1},
+    {acc:2,  r0:3,   r1:3,   r2:3,   iter:1},
+    {acc:2,  r0:2,   r1:3,   r2:3,   iter:1},
+    {acc:2,  r0:2,   r1:3,   r2:3,   iter:'→1'},
+    {acc:2,  r0:2,   r1:2,   r2:3,   iter:2},
+    {acc:1,  r0:2,   r1:2,   r2:3,   iter:2},
+    {acc:1,  r0:2,   r1:2,   r2:3,   iter:2},
+    {acc:1,  r0:2,   r1:2,   r2:2,   iter:2},
+    {acc:1,  r0:1,   r1:2,   r2:2,   iter:2},
+    {acc:1,  r0:1,   r1:2,   r2:2,   iter:'→2'},
+    {acc:1,  r0:1,   r1:1,   r2:2,   iter:3},
+    {acc:1,  r0:1,   r1:1,   r2:2,   iter:3},
+    {acc:1,  r0:1,   r1:1,   r2:2,   iter:3},
+    {acc:0,  r0:1,   r1:1,   r2:1,   iter:3},
+    {acc:0,  r0:0,   r1:1,   r2:1,   iter:3},
+    {acc:0,  r0:0,   r1:1,   r2:1,   iter:'→3'},
+    {acc:0,  r0:0,   r1:0,   r2:1,   iter:4},
+    {acc:0,  r0:0,   r1:0,   r2:1,   iter:4},
+    {acc:0,  r0:0,   r1:0,   r2:1,   iter:'exit'},
+    {acc:0,  r0:0,   r1:0,   r2:1,   iter:'done'},
+  ];
+
+  const stepper = document.querySelector('.stepper');
+  const regDisplay = document.getElementById('loop-reg-display');
+  const steps = JSON.parse(stepper.dataset.steps);
+  const instrLines = stepper.querySelectorAll('.stepper-instructions div');
+  const status = stepper.querySelector('.stepper-status');
+  const prevBtn = stepper.querySelector('[data-prev]');
+  const nextBtn = stepper.querySelector('[data-next]');
+  let current = -1;
+
+  // Map step index → instruction line index
+  // comments are at indices 0,3,9,15
+  const commentIndices = new Set([0,3,9,15]);
+  const instrIndices = [1,2,4,5,6,7,8,10,11,12,13,14,16];
+
+  // Map each of the 29 steps to which instruction line should highlight
+  const stepToLine = [
+    1,2,    // init: LdaSmi, Star
+    4,5,6,7,8,  // iter1 cond: Ldar,Star,LdaSmi,TestGT,JumpIfFalse
+    10,11,12,13,14,  // iter1 body: Ldar,Star,LdaSmi,Sub,Star
+    16,      // JumpLoop (maps to line index 16 but we'll highlight line 14)
+    4,7,8,  // iter2: Ldar(cond), TestGT, JumpIfFalse (abbreviated)
+    13,14,  // iter2 body: Sub, Star
+    16,      // JumpLoop
+    4,7,8,  // iter3
+    13,14,  // iter3 body
+    16,      // JumpLoop
+    4,7,8,  // iter4: condition fails
+    16       // Ldar r0 final
+  ];
+  // Actually let's use a simpler approach — highlight the relevant bytecode line
+  const lineMap = [
+    1,2,         // LdaSmi, Star r0
+    4,5,6,7,8,   // iter1: cond
+    10,11,12,13,14, // iter1: body
+    /* JumpLoop */14,
+    4,7,8,       // iter2: cond (abbreviated in display)
+    13,14,       // iter2: body
+    14,          // JumpLoop
+    4,7,8,       // iter3: cond
+    13,14,       // iter3: body
+    14,          // JumpLoop
+    4,7,8,       // iter4: cond exit
+    16           // final Ldar
+  ];
+
+  function render() {
+    // Clear all highlights
+    instrLines.forEach(line => {
+      line.classList.remove('active','done');
+    });
+
+    // Highlight current instruction line
+    if (current >= 0 && current < lineMap.length) {
+      const targetLine = lineMap[current];
+      if (targetLine !== undefined) {
+        instrLines[targetLine].classList.add('active');
+      }
+    }
+
+    if (current >= 0 && current < states.length) {
+      const s = states[current];
+      const iterLabel = typeof s.iter === 'string' && s.iter.startsWith('→')
+        ? 'jump back'
+        : s.iter === 'exit' ? 'EXIT' : s.iter === 'done' ? 'done' : s.iter === 'init' ? 'init' : 'iter ' + s.iter;
+      regDisplay.innerHTML =
+        '<div><strong>acc</strong> = ' + s.acc + '</div>' +
+        '<div>r0 (x) = ' + s.r0 + '</div>' +
+        '<div>r1 = ' + s.r1 + '</div>' +
+        '<div>r2 = ' + s.r2 + '</div>' +
+        '<div style="margin-top:0.5rem;color:var(--accent);font-weight:600">' + iterLabel + '</div>';
+    } else {
+      regDisplay.innerHTML =
+        '<div><strong>acc</strong> = —</div><div>r0 (x) = —</div><div>r1 = —</div><div>r2 = —</div>';
+    }
+    status.textContent = current < 0 ? 'ready' : current < steps.length ? steps[current].label : 'done';
+    prevBtn.disabled = current < 0;
+    nextBtn.disabled = current >= steps.length - 1;
+  }
+
+  prevBtn.addEventListener('click', () => { if (current > -1) { current--; render(); } });
+  nextBtn.addEventListener('click', () => { if (current < steps.length - 1) { current++; render(); } });
+  render();
+});
+</script>
+
+<h2>Recursion vs. Iteration</h2>
+
+<p>
+  Before this lesson, computing a sum required recursion:
+</p>
+
+<pre><code>// BEFORE: recursion (only option)
+function sum(n) {
+    if (n < 1) { return 0; }
+    return n + sum(n - 1);
+}
+sum(100);</code></pre>
+
+<p>
+  This pushes 100 frames onto the CallStack, each with its own register window.
+  After adding <code>while</code> and reassignment:
+</p>
+
+<pre><code>// AFTER: iteration
+let total = 0;
+let i = 100;
+while (i > 0) {
+    total = total + i;
+    i = i - 1;
+}
+total;</code></pre>
+
+<p>One frame. A few registers. No stack growth. No GC pressure.</p>
+
+<table class="ref-table">
+  <thead><tr><th>Aspect</th><th>Recursive sum(n)</th><th>Iterative while loop</th></tr></thead>
+  <tbody>
+    <tr><td>Frames used</td><td>n + 1</td><td>1</td></tr>
+    <tr><td>CallStack slots</td><td>~3n</td><td>~4 (fixed)</td></tr>
+    <tr><td>Closure lookups/iter</td><td>1</td><td>0</td></tr>
+    <tr><td>Bytecodes/iter</td><td>~12</td><td>~10</td></tr>
+    <tr><td>Stack overflow risk</td><td>Yes (~10K depth)</td><td>No</td></tr>
+  </tbody>
+</table>
+
+<div class="quiz" data-correct="2"
+     data-right="Correct. The while loop runs in a single frame using a fixed number of registers. It just re-executes the same bytecode — no function calls, no frame allocation."
+     data-wrong="Think about what happens during each iteration. Does the while loop push a new frame? Does it allocate new registers? Or does it reuse the same ones?">
+  <div class="quiz-question">
+    Why does the iterative version use constant memory regardless of input size?
+  </div>
+  <div class="quiz-options">
+    <div class="quiz-option">The VM pre-allocates memory for all iterations</div>
+    <div class="quiz-option">The GC collects memory between iterations</div>
+    <div class="quiz-option">Each iteration reuses the same frame and registers &mdash; no stack growth</div>
+    <div class="quiz-option">The compiler unrolls the loop into straight-line code</div>
+  </div>
+  <div class="quiz-feedback"></div>
+</div>
+
+<h2>How V8 Compiles While Loops</h2>
+
+<p>
+  V8&rsquo;s Ignition bytecode for the same pattern:
+</p>
+
+<pre><code>// V8: while (x > 0) { x = x - 1; }
+   0: Ldar a0
+   2: Star r0
+   4: LdaZero
+   5: TestGreaterThan r0, [0]
+   7: JumpIfFalse [16]
+   9: Ldar a0
+  11: Sub [1], [1]
+  13: Star a0
+  15: JumpLoop [0], [15]
+  17: ...</code></pre>
+
+<table class="ref-table">
+  <thead><tr><th>Feature</th><th>g8 (yours)</th><th>V8 Ignition</th></tr></thead>
+  <tbody>
+    <tr><td>Backward jump opcode</td><td><code>JumpLoop [offset]</code></td><td><code>JumpLoop [slot], [offset]</code></td></tr>
+    <tr><td>Load zero</td><td><code>LdaSmi [idx]</code></td><td><code>LdaZero</code> (specialized)</td></tr>
+    <tr><td>Sub operand</td><td>Register</td><td>Immediate + feedback slot</td></tr>
+    <tr><td>Locals vs args</td><td>Both use <code>rN</code></td><td><code>a0</code> for args, <code>r0</code> for locals</td></tr>
+    <tr><td>Profiling data</td><td>None</td><td>Feedback slots on JumpLoop, comparisons, arithmetic</td></tr>
+  </tbody>
+</table>
+
+<p>
+  The structure is identical: condition &rarr; JumpIfFalse &rarr; body &rarr; JumpLoop.
+  V8 adds feedback slots for profiling; you&rsquo;ll add those when you implement
+  optimization.
+</p>
+
+<h2>Implementation Steps</h2>
+
+<ol>
+  <li><strong>Lexer:</strong> Add <code>While</code> to <code>SymbolKind</code> and
+    recognize <code>"while"</code> as a keyword.</li>
+  <li><strong>AST:</strong> Add <code>Stmt::While { condition, body }</code> and
+    <code>Stmt::Assign { name, value }</code>.</li>
+  <li><strong>Parser:</strong> Handle <code>while</code> in <code>parse_stmt</code>.
+    Add lookahead in <code>parse_expr_stmt</code> to detect assignment.</li>
+  <li><strong>Bytecode:</strong> Add <code>JumpLoop = 21</code> to the enum and the
+    <code>From&lt;u8&gt;</code> / <code>Display</code> impls.</li>
+  <li><strong>Compiler:</strong> Compile <code>While</code> with the loop-start /
+    JumpIfFalse / body / JumpLoop pattern. Compile <code>Assign</code> as
+    expr + <code>Star</code>.</li>
+  <li><strong>VM:</strong> Add the <code>JumpLoop</code> handler (read byte, advance,
+    subtract).</li>
+  <li><strong>Test:</strong> <pre style="display:inline"><code>let x = 10; let total = 0; while (x > 0) { total = total + x; x = x - 1; } total;</code></pre>
+    &rarr; should produce <code>55</code>.</li>
+</ol>
+
+<div class="callout">
+  <strong>Test incrementally.</strong> Get variable reassignment working first:
+  <code>let x = 10; x = 20; x;</code> &rarr; <code>20</code>. Then add while
+  with a simple countdown: <code>let x = 3; while (x > 0) { x = x - 1; } x;</code>
+  &rarr; <code>0</code>. Then try the accumulator pattern.
+</div>
+
+<h2>Check Your Understanding</h2>
+
+<div class="quiz" data-correct="3"
+     data-right="Correct. The pattern is: record loop_start, compile condition, emit JumpIfFalse (forward, patched), compile body, emit JumpLoop (backward to loop_start), patch exit."
+     data-wrong="Think about the two jumps in a while loop: one goes forward (skip body when condition is false) and one goes backward (repeat from condition). Which is emitted when?">
+  <div class="quiz-question">
+    Put the while-loop compilation steps in order:
+    <br>(A) emit JumpLoop to loop_start
+    <br>(B) record loop_start position
+    <br>(C) emit JumpIfFalse placeholder
+    <br>(D) compile body
+  </div>
+  <div class="quiz-options">
+    <div class="quiz-option">C, B, D, A</div>
+    <div class="quiz-option">B, D, C, A</div>
+    <div class="quiz-option">B, C, A, D</div>
+    <div class="quiz-option">B, C, D, A</div>
+  </div>
+  <div class="quiz-feedback"></div>
+</div>
+
+<div class="quiz" data-correct="1"
+     data-right="Correct! Back edges are where the runtime checks for stack overflow, GC safe points, debugger breakpoints, and whether to tier up to the optimizing compiler. A unified Jump opcode would need an extra branch on every jump to check direction."
+     data-wrong="Think about what the VM might want to do every time a loop repeats. There are runtime checks that should happen on back edges but not on forward jumps — like checking if the stack is about to overflow.">
+  <div class="quiz-question">
+    Why does V8 use a separate <code>JumpLoop</code> opcode instead of allowing
+    <code>Jump</code> to take negative offsets?
+  </div>
+  <div class="quiz-options">
+    <div class="quiz-option">Negative offsets would require 16-bit operands</div>
+    <div class="quiz-option">Back edges need runtime checks (stack overflow, GC, optimization) that forward jumps don&rsquo;t</div>
+    <div class="quiz-option">The VM can&rsquo;t subtract from the program counter</div>
+    <div class="quiz-option">V8 doesn&rsquo;t support while loops in the interpreter</div>
+  </div>
+  <div class="quiz-feedback"></div>
+</div>
+
+<h2>What This Unlocks</h2>
+
+<p>With <code>while</code> and variable reassignment, your VM can express:</p>
+
+<ul>
+  <li><strong>Iterative algorithms:</strong> sum, factorial, GCD, any accumulator pattern</li>
+  <li><strong>String building:</strong> <code>while (i &lt; 10) { s = s + "x"; i = i + 1; }</code></li>
+  <li><strong>Bounded iteration:</strong> repeat N times without recursion or stack risk</li>
+</ul>
+
+<p>Still missing (future lessons):</p>
+<ul>
+  <li><strong><code>for</code> loops:</strong> syntactic sugar &mdash;
+    <code>for&nbsp;(init;&nbsp;cond;&nbsp;update)</code> desugars to
+    <code>init; while&nbsp;(cond)&nbsp;{ body; update; }</code></li>
+  <li><strong><code>break</code>/<code>continue</code>:</strong> require tracking the
+    loop&rsquo;s exit and header addresses during compilation</li>
+  <li><strong>Upvalue capture:</strong> closures that read/write variables from enclosing
+    scopes</li>
+</ul>
+
+<h2>Primary Sources</h2>
+
+<p>
+  <a href="https://craftinginterpreters.com/jumping-back-and-forth.html">Crafting Interpreters, Ch.&nbsp;23</a>
+  covers while loops, for loops, and break/continue &mdash; all using the same
+  JumpLoop + backpatch technique. For V8&rsquo;s implementation, see
+  <code>src/interpreter/bytecode-generator.cc</code> (search for
+  <code>VisitWhileStatement</code>) and the <code>JumpLoop</code> handler in
+  <code>src/interpreter/interpreter-generator.cc</code>.
+</p>
+
+<nav class="lesson-nav">
+  <a href="0010-closures-functions-on-the-heap.html">&larr; Lesson 10: Closures</a>
+  <a href="../reference/bytecode-instruction-set.html">Reference &rarr;</a>
+</nav>
+
+<footer>
+  Questions about anything in this lesson? Ask your agent &mdash; that&rsquo;s what it&rsquo;s here for.
+  <br><br>
+  g8 teaching workspace &middot;
+  <a href="0001-ast-to-stack-bytecode.html">Lesson 1</a> &middot;
+  <a href="0002-building-the-vm.html">Lesson 2</a> &middot;
+  <a href="0003-the-accumulator-model.html">Lesson 3</a> &middot;
+  <a href="0004-variables.html">Lesson 4</a> &middot;
+  <a href="0005-functions-and-call-frames.html">Lesson 5</a> &middot;
+  <a href="0006-control-flow.html">Lesson 6</a> &middot;
+  <a href="0007-tagged-values-and-the-heap.html">Lesson 7</a> &middot;
+  <a href="0008-garbage-collection.html">Lesson 8</a> &middot;
+  <a href="0009-the-isolate.html">Lesson 9</a> &middot;
+  <a href="0010-closures-functions-on-the-heap.html">Lesson 10</a> &middot;
+  <a href="../reference/bytecode-instruction-set.html">Instruction Set Reference</a>
+</footer>
+
+<script src="../assets/quiz.js"></script>
+</body>
+</html>
