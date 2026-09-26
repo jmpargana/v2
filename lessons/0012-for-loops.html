@@ -1,0 +1,521 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Lesson 12: For Loops &mdash; Syntactic Sugar</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<h1>For Loops &mdash; Syntactic Sugar</h1>
+<p class="lesson-meta">
+  Lesson 12 &middot; ~20 min &middot;
+  Prev: <a href="0011-while-loops.html">Lesson 11</a> &middot;
+  Reference: <a href="../reference/bytecode-instruction-set.html">Instruction Set</a>
+</p>
+
+<p>
+  A <code>for</code> loop is not a new concept for the VM. It&rsquo;s syntactic sugar &mdash;
+  a nicer way to write something the compiler already knows how to do. This lesson adds zero
+  new bytecodes. The parser does all the work: it reads <code>for</code> syntax and produces
+  AST nodes that the compiler already handles.
+</p>
+
+<h2>The Desugaring</h2>
+
+<p>
+  Every <code>for</code> loop maps directly onto a <code>while</code> loop:
+</p>
+
+<pre><code>// Source:
+for (let i = 0; i &lt; 10; i = i + 1) {
+    total = total + i;
+}
+
+// Desugars to:
+let i = 0;
+while (i &lt; 10) {
+    total = total + i;
+    i = i + 1;
+}</code></pre>
+
+<p>
+  The three parts of the <code>for</code> header &mdash; <strong>init</strong>,
+  <strong>condition</strong>, <strong>update</strong> &mdash; just rearrange into a
+  <code>while</code> loop:
+</p>
+
+<ol>
+  <li><strong>Init</strong> runs once, before the loop.</li>
+  <li><strong>Condition</strong> becomes the <code>while</code> condition.</li>
+  <li><strong>Update</strong> appends to the end of the body.</li>
+</ol>
+
+<pre><code>for (init; condition; update) { body }
+    ↓
+init;
+while (condition) { body; update; }</code></pre>
+
+<div class="quiz" data-correct="2"
+     data-right="Correct! The for loop is pure syntactic sugar. The compiler already knows how to compile while loops, variable declarations, and assignments. The for-loop parser just rearranges these pieces."
+     data-wrong="Think about what new bytecodes a for loop would need. Does it do anything that a while loop with an initializer and updater doesn't?">
+  <div class="quiz-question">
+    How many new bytecodes does adding <code>for</code> loops require?
+  </div>
+  <div class="quiz-options">
+    <div class="quiz-option">1 &mdash; a ForLoop opcode</div>
+    <div class="quiz-option">2 &mdash; ForInit and ForUpdate</div>
+    <div class="quiz-option">0 &mdash; it desugars to existing while-loop bytecodes</div>
+    <div class="quiz-option">3 &mdash; ForInit, ForCondition, ForUpdate</div>
+  </div>
+  <div class="quiz-feedback"></div>
+</div>
+
+<h2>Two Approaches to Desugaring</h2>
+
+<p>
+  There are two ways to implement this, and both are legitimate:
+</p>
+
+<h3>Option A: Desugar in the parser</h3>
+<p>
+  The parser reads <code>for</code> syntax and emits existing AST nodes. No
+  <code>Stmt::ForLoop</code> variant needed. The compiler never knows a <code>for</code>
+  loop existed:
+</p>
+
+<pre><code>fn parse_for_loop(&amp;mut self) -> Vec&lt;Stmt&gt; {
+    // Returns multiple statements: [init, while_loop]
+    ...
+}</code></pre>
+
+<h3>Option B: Add a ForLoop AST node</h3>
+<p>
+  The parser creates a <code>Stmt::ForLoop</code>, and the compiler desugars it during
+  compilation by compiling the init, then entering a while-style loop:
+</p>
+
+<pre><code>Stmt::ForLoop { init, condition, update, body }</code></pre>
+
+<p>
+  Option A is simpler (fewer changes). Option B preserves source structure in the AST, which
+  matters if you ever want to pretty-print or debug the AST. Both produce identical bytecode.
+</p>
+
+<div class="callout">
+  <strong>V8&rsquo;s approach:</strong> V8 uses Option B. The AST has a
+  <code>ForStatement</code> node, and the bytecode generator handles it explicitly in
+  <code>VisitForStatement</code>. But the bytecodes it emits are the same as a
+  <code>while</code> &mdash; condition, <code>JumpIfFalse</code>, body, update,
+  <code>JumpLoop</code>. The AST distinction matters for V8 because it feeds into scope
+  analysis, debugging, and source mapping. For a teaching VM, either approach works.
+</div>
+
+<h2>Lexer: the <code>for</code> keyword</h2>
+
+<p>
+  Add <code>For</code> to <code>SymbolKind</code> and recognize it in the keyword match:
+</p>
+
+<pre><code>// lex.rs
+pub enum SymbolKind {
+    // ... existing variants ...
+    For,
+}
+
+// In the keyword match:
+"for" => res.push(Symbol {
+    kind: SymbolKind::For,
+    int_val: None,
+    str_val: String::new(),
+}),</code></pre>
+
+<h2>AST: the ForLoop node</h2>
+
+<p>
+  We&rsquo;ll use Option B &mdash; an explicit AST node. This keeps the parser clean and
+  preserves the source structure:
+</p>
+
+<pre><code>pub enum Stmt {
+    // ... existing variants ...
+    ForLoop {
+        init: Box&lt;Stmt&gt;,
+        condition: Expr,
+        update: Box&lt;Stmt&gt;,
+        body: Vec&lt;Stmt&gt;,
+    },
+}</code></pre>
+
+<p>
+  <code>init</code> is typically a <code>VarDecl</code>. <code>update</code> is typically an
+  <code>Assign</code>. Both are <code>Box&lt;Stmt&gt;</code> because the enum is recursive.
+</p>
+
+<h2>Parser</h2>
+
+<p>
+  Add <code>SymbolKind::For</code> to the <code>parse_stmt</code> dispatch, then parse the
+  three-part header:
+</p>
+
+<pre><code>fn parse_stmt(&amp;mut self) -> Stmt {
+    match self.peek() {
+        // ... existing arms ...
+        SymbolKind::For => self.parse_for_loop(),
+        _ => self.parse_expr_stmt(),
+    }
+}
+
+fn parse_for_loop(&amp;mut self) -> Stmt {
+    self.expect(SymbolKind::For);
+    self.expect(SymbolKind::LPar);
+
+    // Init: typically "let i = 0;"
+    let init = self.parse_stmt();
+
+    // Condition: typically "i < 10"
+    let condition = self.parse_expr();
+    self.expect(SymbolKind::Semi);
+
+    // Update: typically "i = i + 1" (no trailing semicolon — RPar follows)
+    let update = self.parse_for_update();
+    self.expect(SymbolKind::RPar);
+
+    // Body
+    self.expect(SymbolKind::LBrace);
+    let mut body = Vec::new();
+    while self.peek() != SymbolKind::RBrace {
+        body.push(self.parse_stmt());
+    }
+    self.expect(SymbolKind::RBrace);
+
+    Stmt::ForLoop {
+        init: Box::new(init),
+        condition,
+        update: Box::new(update),
+        body,
+    }
+}</code></pre>
+
+<h3>Parsing the update clause</h3>
+
+<p>
+  The update clause is tricky. <code>i = i + 1</code> looks like an assignment statement,
+  but it doesn&rsquo;t end with <code>;</code> &mdash; it&rsquo;s followed by <code>)</code>.
+  You need a separate parser for this:
+</p>
+
+<pre><code>fn parse_for_update(&amp;mut self) -> Stmt {
+    if self.peek() == SymbolKind::Ident
+        &amp;&amp; self.pos + 1 &lt; self.syms.len()
+        &amp;&amp; self.syms[self.pos + 1].kind == SymbolKind::Assign
+    {
+        let name = self.pop().str_val;
+        self.expect(SymbolKind::Assign);
+        let value = self.parse_expr();
+        return Stmt::Assign { name, value };
+    }
+    let expr = self.parse_expr();
+    Stmt::ExprStmt(expr)
+}</code></pre>
+
+<p>
+  This is identical to <code>parse_expr_stmt</code> but without the trailing
+  <code>expect(Semi)</code>.
+</p>
+
+<div class="quiz" data-correct="1"
+     data-right="Correct! The init clause (e.g., `let i = 0;`) ends with a semicolon because it's a full statement. The condition ends with a semicolon as a separator. But the update is followed by `)`, not `;` — so it needs special handling."
+     data-wrong="Look at the syntax: `for (let i = 0; i < 10; i = i + 1)`. Count the semicolons. The init and condition have trailing semicolons, but what follows the update?">
+  <div class="quiz-question">
+    Why does the update clause need its own parsing function instead of reusing
+    <code>parse_expr_stmt</code>?
+  </div>
+  <div class="quiz-options">
+    <div class="quiz-option">The update might be an expression, not a statement</div>
+    <div class="quiz-option">The update is not followed by a semicolon &mdash; <code>)</code> comes next</div>
+    <div class="quiz-option">The update runs in a different scope</div>
+    <div class="quiz-option">The update can contain multiple statements</div>
+  </div>
+  <div class="quiz-feedback"></div>
+</div>
+
+<h2>Compiler: Desugaring at Compile Time</h2>
+
+<p>
+  The compiler treats <code>ForLoop</code> exactly like its <code>while</code> equivalent.
+  This is the elegant payoff &mdash; all the hard work was done in Lesson&nbsp;11:
+</p>
+
+<pre><code>Stmt::ForLoop { init, condition, update, body } => {
+    // 1. Compile the initializer (runs once)
+    self.compile_stmt(init, heap);
+
+    // 2. Record loop start (same as while)
+    let loop_start = self.code.len();
+
+    // 3. Compile condition + exit jump (same as while)
+    self.compile_expr(condition, heap);
+    let exit_jump = self.emit_jump(ByteCode::JumpIfFalse);
+
+    // 4. Compile body (same as while)
+    self.compile_stmts(body, heap);
+
+    // 5. Compile the update (runs after each iteration)
+    self.compile_stmt(update, heap);
+
+    // 6. JumpLoop back to condition (same as while)
+    self.code.push(ByteCode::JumpLoop as u8);
+    self.code.push((self.code.len() + 1 - loop_start) as u8);
+
+    // 7. Patch exit jump (same as while)
+    self.patch_jump(exit_jump);
+}</code></pre>
+
+<p>
+  Steps 2, 3, 6, and 7 are identical to <code>WhileLoop</code> compilation. Steps 1 and 5
+  are the only additions &mdash; compiling <code>init</code> before the loop and
+  <code>update</code> at the end of each iteration. The bytecodes emitted are the same ones
+  you&rsquo;ve been using all along.
+</p>
+
+<h2>Bytecode Output</h2>
+
+<p>Source:</p>
+
+<pre><code>var total = 0;
+for (var i = 1; i &lt;= 5; i = i + 1) {
+    total = total + i;
+}
+total;</code></pre>
+
+<p>Compiled bytecode:</p>
+
+<pre><code>addr  instruction        effect
+&mdash;&mdash;&mdash;&mdash;  &mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;  &mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;
+0000  LdaSmi [0] (0)      acc = 0
+0002  Star r0              r0 = 0  (var total = 0)
+0004  LdaSmi [1] (1)      acc = 1
+0006  Star r1              r1 = 1  (var i = 1 &mdash; init)
+
+                           &larr; loop_start (addr 0008)
+0008  Ldar r1              acc = i
+0010  Star r2              r2 = i  (stash for comparison)
+0012  LdaSmi [2] (5)      acc = 5
+0014  TestLessEqual r2     acc = (i &lt;= 5) ? 1 : 0
+0016  JumpIfFalse 20       if acc==0, jump to exit
+
+0018  Ldar r0              acc = total
+0020  Star r3              r3 = total  (stash for addition)
+0022  Ldar r1              acc = i
+0024  Add r3               acc = total + i
+0026  Star r0              r0 = acc  (total = total + i)
+
+0028  Ldar r1              acc = i
+0030  Star r4              r4 = i  (stash for addition)
+0032  LdaSmi [3] (1)      acc = 1
+0034  Add r4               acc = i + 1
+0036  Star r1              r1 = acc  (i = i + 1 &mdash; update)
+
+0038  JumpLoop 32          pc = 0040 - 32 = 0008  &larr; back edge
+
+0040  Ldar r0              acc = total  (final expression)
+</code></pre>
+
+<p>
+  Compare this with the <code>while</code> version of the same program: the bytecode is
+  identical. The <code>for</code> syntax just let the programmer put the init, condition,
+  and update on one line instead of three.
+</p>
+
+<h2>Why Syntactic Sugar Matters</h2>
+
+<p>
+  &ldquo;Syntactic sugar&rdquo; sounds dismissive, but it&rsquo;s one of the most important
+  concepts in language design. Here&rsquo;s why:
+</p>
+
+<ol>
+  <li><strong>Zero runtime cost.</strong> The bytecodes are identical. There&rsquo;s no
+      &ldquo;for loop overhead&rdquo; &mdash; the VM literally cannot tell whether the source
+      was <code>for</code> or <code>while</code>.</li>
+  <li><strong>Locality of intent.</strong> <code>for (let i = 0; i &lt; n; i = i + 1)</code>
+      puts the loop variable, its bound, and its increment in one place. With <code>while</code>,
+      these are scattered across three locations, inviting bugs (forget the increment? infinite loop).</li>
+  <li><strong>Compiler simplicity.</strong> No new bytecodes, no new VM handlers, no new
+      optimization paths. The compiler reuses everything from <code>while</code>.</li>
+</ol>
+
+<div class="callout">
+  <strong>Real-world example:</strong> Python&rsquo;s <code>for x in range(n)</code>,
+  JavaScript&rsquo;s <code>for...of</code>, and Rust&rsquo;s <code>for x in 0..n</code> all
+  desugar to iterator-based loops internally. The surface syntax is different; the underlying
+  mechanism is shared. This is the same principle at a larger scale.
+</div>
+
+<h2>How V8 Compiles For Loops</h2>
+
+<p>V8&rsquo;s bytecode generator handles <code>for</code> in <code>VisitForStatement</code>:</p>
+
+<pre><code>// Pseudocode of V8's VisitForStatement
+void BytecodeGenerator::VisitForStatement(ForStatement* stmt) {
+    // 1. Compile init
+    Visit(stmt->init());
+
+    // 2. Loop header
+    LoopBuilder loop_builder(this);
+    loop_builder.LoopHeader();
+
+    // 3. Condition + exit
+    if (stmt->cond()) {
+        Visit(stmt->cond());
+        loop_builder.BreakIfFalse();
+    }
+
+    // 4. Body
+    Visit(stmt->body());
+
+    // 5. Update + back edge
+    Visit(stmt->next());
+    loop_builder.JumpToHeader();
+}</code></pre>
+
+<p>
+  The structure is the same: init &rarr; loop header &rarr; condition &rarr;
+  <code>JumpIfFalse</code> &rarr; body &rarr; update &rarr; <code>JumpLoop</code>.
+  V8&rsquo;s <code>LoopBuilder</code> handles the offset bookkeeping that you do manually
+  with <code>emit_jump</code> and <code>patch_jump</code>.
+</p>
+
+<div class="quiz" data-correct="0"
+     data-right="Correct. The update runs after each iteration of the body, before the JumpLoop back to the condition. It's the last thing before re-testing."
+     data-wrong="Trace through the execution: init runs once, then the loop starts. Each iteration: test condition, run body, then what? The update must happen before jumping back.">
+  <div class="quiz-question">
+    In the compiled bytecode for <code>for (init; cond; update) { body }</code>,
+    where does the update code appear?
+  </div>
+  <div class="quiz-options">
+    <div class="quiz-option">After the body, before JumpLoop</div>
+    <div class="quiz-option">Before the condition, after JumpLoop</div>
+    <div class="quiz-option">At the beginning of the body</div>
+    <div class="quiz-option">After JumpLoop, before the exit point</div>
+  </div>
+  <div class="quiz-feedback"></div>
+</div>
+
+<h2>Implementation Steps</h2>
+
+<ol>
+  <li><strong>Lexer:</strong> Add <code>For</code> to <code>SymbolKind</code> and recognize
+    <code>"for"</code> as a keyword.</li>
+  <li><strong>AST:</strong> Add <code>Stmt::ForLoop { init, condition, update, body }</code>.
+    Add <code>Display</code> for the new variant.</li>
+  <li><strong>Parser:</strong> Handle <code>SymbolKind::For</code> in <code>parse_stmt</code>.
+    Write <code>parse_for_loop</code> and <code>parse_for_update</code> (like
+    <code>parse_expr_stmt</code> but without trailing semicolon).</li>
+  <li><strong>Compiler:</strong> Match <code>Stmt::ForLoop</code> &mdash; compile init, then
+    the standard while-loop pattern with update before <code>JumpLoop</code>.</li>
+  <li><strong>Test:</strong> <pre style="display:inline"><code>var total = 0; for (var i = 1; i &lt;= 5; i = i + 1) { total = total + i; } total;</code></pre>
+    &rarr; should produce <code>15</code>.</li>
+</ol>
+
+<div class="callout">
+  <strong>The update clause is the only tricky part.</strong> Everything else reuses existing
+  infrastructure. If your while-loop tests pass, <code>for</code> loop compilation will work
+  on the first try &mdash; the bytecode patterns are identical.
+</div>
+
+<h2>Check Your Understanding</h2>
+
+<div class="quiz" data-correct="1"
+     data-right="Correct. The init only runs once (before the loop starts), so it is compiled before the loop_start marker. The condition, body, update, and JumpLoop are inside the loop — they repeat on every iteration."
+     data-wrong="Think about which parts of a for loop repeat. The init runs once. The condition, body, and update repeat. Where must loop_start be placed so that JumpLoop skips back to the right spot?">
+  <div class="quiz-question">
+    Why is the init compiled <em>before</em> the <code>loop_start</code> marker?
+  </div>
+  <div class="quiz-options">
+    <div class="quiz-option">Because the init might use registers needed by the condition</div>
+    <div class="quiz-option">Because init runs once &mdash; JumpLoop must not re-execute it</div>
+    <div class="quiz-option">Because the init is always a variable declaration</div>
+    <div class="quiz-option">Because the compiler can&rsquo;t handle init inside the loop</div>
+  </div>
+  <div class="quiz-feedback"></div>
+</div>
+
+<div class="quiz" data-correct="2"
+     data-right="Correct! A for loop desugars to init + while(condition) { body; update; }. The init and update are just existing statement types (VarDecl, Assign). The condition and body are the same as while. No new bytecodes needed."
+     data-wrong="Compare the bytecode output of a for loop with the equivalent while loop. Are any of the opcodes different?">
+  <div class="quiz-question">
+    A student claims that <code>for</code> loops must be faster than <code>while</code> loops
+    because they have dedicated syntax. Are they right?
+  </div>
+  <div class="quiz-options">
+    <div class="quiz-option">Yes &mdash; the compiler can optimize the structured form</div>
+    <div class="quiz-option">Depends &mdash; for is faster with small loop variables</div>
+    <div class="quiz-option">No &mdash; both produce identical bytecode</div>
+    <div class="quiz-option">Yes &mdash; for loops use fewer registers</div>
+  </div>
+  <div class="quiz-feedback"></div>
+</div>
+
+<h2>What This Unlocks</h2>
+
+<p>With <code>for</code> loops, your VM can express:</p>
+
+<ul>
+  <li><strong>Counted iteration:</strong> <code>for (let i = 0; i &lt; n; i = i + 1)</code></li>
+  <li><strong>Summation:</strong> <code>for (let i = 1; i &lt;= n; i = i + 1) { total = total + i; }</code></li>
+  <li><strong>Nested loops:</strong> <code>for (...) { for (...) { ... } }</code></li>
+</ul>
+
+<p>Still missing (future lessons):</p>
+<ul>
+  <li><strong><code>break</code>/<code>continue</code>:</strong> require tracking the
+    loop&rsquo;s exit and header addresses during compilation, and a loop-context stack in
+    the compiler</li>
+  <li><strong><code>do-while</code>:</strong> like <code>while</code> but the condition
+    check is at the bottom &mdash; the body always executes at least once</li>
+  <li><strong><code>for...in</code>/<code>for...of</code>:</strong> require iterators
+    and object/array support</li>
+</ul>
+
+<h2>Primary Sources</h2>
+
+<p>
+  <a href="https://craftinginterpreters.com/jumping-back-and-forth.html">Crafting Interpreters, Ch.&nbsp;23</a>
+  covers <code>for</code> loops as desugaring into <code>while</code>, using the same
+  approach described here. For V8&rsquo;s implementation, see
+  <code>src/interpreter/bytecode-generator.cc</code> (search for
+  <code>VisitForStatement</code>).
+</p>
+
+<nav class="lesson-nav">
+  <a href="0011-while-loops.html">&larr; Lesson 11: While Loops</a>
+  <a href="0013-objects.html">Lesson 13: Objects &rarr;</a>
+</nav>
+
+<footer>
+  Questions about anything in this lesson? Ask your agent &mdash; that&rsquo;s what it&rsquo;s here for.
+  <br><br>
+  g8 teaching workspace &middot;
+  <a href="0001-ast-to-stack-bytecode.html">Lesson 1</a> &middot;
+  <a href="0002-building-the-vm.html">Lesson 2</a> &middot;
+  <a href="0003-the-accumulator-model.html">Lesson 3</a> &middot;
+  <a href="0004-variables.html">Lesson 4</a> &middot;
+  <a href="0005-functions-and-call-frames.html">Lesson 5</a> &middot;
+  <a href="0006-control-flow.html">Lesson 6</a> &middot;
+  <a href="0007-tagged-values-and-the-heap.html">Lesson 7</a> &middot;
+  <a href="0008-garbage-collection.html">Lesson 8</a> &middot;
+  <a href="0009-the-isolate.html">Lesson 9</a> &middot;
+  <a href="0010-closures-functions-on-the-heap.html">Lesson 10</a> &middot;
+  <a href="0011-while-loops.html">Lesson 11</a> &middot;
+  <a href="0012-for-loops.html">Lesson 12</a> &middot;
+  <a href="0013-objects.html">Lesson 13</a> &middot;
+  <a href="../reference/bytecode-instruction-set.html">Instruction Set Reference</a>
+</footer>
+
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

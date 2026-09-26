@@ -245,7 +245,25 @@ impl Compiler {
                 let jump_false = self.emit_jump(ByteCode::JumpIfFalse);
                 self.compile_stmts(body, heap);
                 self.code.push(ByteCode::JumpLoop as u8);
-                self.code.push((self.code.len() + 1 - jump_loop_marker) as u8);
+                self.code
+                    .push((self.code.len() + 1 - jump_loop_marker) as u8);
+                self.patch_jump(jump_false);
+            }
+            Stmt::ForLoop {
+                init,
+                condition,
+                body,
+                update,
+            } => {
+                self.compile_stmt(init, heap);
+                let jump_loop_marker = self.code.len();
+                self.compile_expr(condition, heap);
+                let jump_false = self.emit_jump(ByteCode::JumpIfFalse);
+                self.compile_stmts(body, heap);
+                self.compile_stmt(update, heap);
+                self.code.push(ByteCode::JumpLoop as u8);
+                self.code
+                    .push((self.code.len() + 1 - jump_loop_marker) as u8);
                 self.patch_jump(jump_false);
             }
         }

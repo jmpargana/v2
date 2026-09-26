@@ -1,0 +1,726 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Lesson 13: Objects &mdash; Property Maps on the Heap</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<h1>Objects &mdash; Property Maps on the Heap</h1>
+<p class="lesson-meta">
+  Lesson 13 &middot; ~45 min &middot;
+  Prev: <a href="0012-for-loops.html">Lesson 12</a> &middot;
+  Reference: <a href="../reference/bytecode-instruction-set.html">Instruction Set</a>
+</p>
+
+<p>
+  Until now, every value in your VM is either a number or a string. There are no
+  compound data structures &mdash; no way to group related values together. In JavaScript,
+  the answer is the <strong>object</strong>: a bag of named properties, each holding a Value.
+</p>
+<p>
+  This lesson adds a new heap type (<code>JSObject</code>), three new bytecodes
+  (<code>CreateObject</code>, <code>SetProperty</code>, <code>GetProperty</code>),
+  and the syntax for object literals and dot-access. It&rsquo;s the biggest change since
+  closures &mdash; and the foundation for everything that follows (arrays, classes,
+  prototypes, <code>this</code>).
+</p>
+
+<h2>What an Object Is</h2>
+
+<p>
+  At the language level, a JavaScript object is a collection of key&ndash;value pairs:
+</p>
+
+<pre><code>let point = { x: 10, y: 20 };
+point.x;       // 10
+point.y = 30;  // update a property</code></pre>
+
+<p>
+  At the VM level, an object is a <strong>heap-allocated map from strings to Values</strong>.
+  When you write <code>point.x</code>, the VM looks up the string <code>"x"</code> in the
+  object&rsquo;s property map and returns the associated Value.
+</p>
+
+<h2>The New Heap Type: JSObject</h2>
+
+<pre><code>use std::collections::HashMap;
+
+pub struct JSObject {
+    pub properties: HashMap&lt;String, Value&gt;,
+}
+
+pub enum HeapObject {
+    String(HeapString),
+    Function(BytecodeFunction),
+    Closure(Closure),
+    Object(JSObject),           // &larr; new
+}</code></pre>
+
+<p>
+  A <code>HashMap&lt;String, Value&gt;</code> is the simplest correct implementation.
+  Each property name maps to a Value that can be a Smi, a heap pointer to a string,
+  a closure, or even another object. The values are fully dynamic &mdash; any property
+  can hold any type, and properties can be added at any time.
+</p>
+
+<div class="quiz" data-correct="2"
+     data-right="Correct! A HashMap gives O(1) average-case lookup by property name — the simplest correct implementation. An array would require knowing property order and indexing by position, which doesn't match JavaScript's dynamic property model."
+     data-wrong="Think about how property access works: `obj.x` looks up the string 'x'. What data structure lets you look up a value by a string key efficiently?">
+  <div class="quiz-question">
+    Why use a <code>HashMap&lt;String, Value&gt;</code> for object properties instead of a
+    <code>Vec&lt;Value&gt;</code>?
+  </div>
+  <div class="quiz-options">
+    <div class="quiz-option">Vec doesn&rsquo;t support heap-allocated Values</div>
+    <div class="quiz-option">Objects can only have string keys, so Vec is incompatible</div>
+    <div class="quiz-option">Properties are accessed by name &mdash; a map gives O(1) lookup by key</div>
+    <div class="quiz-option">HashMap is required by the JavaScript specification</div>
+  </div>
+  <div class="quiz-feedback"></div>
+</div>
+
+<h2>Three New Bytecodes</h2>
+
+<p>
+  Objects need three operations: create, read a property, write a property. Each gets a bytecode:
+</p>
+
+<table class="ref-table">
+  <thead>
+    <tr><th>Bytecode</th><th>Value</th><th>Operands</th><th>Effect</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>CreateObject</code></td>
+      <td>22</td>
+      <td>none</td>
+      <td>Allocate empty JSObject on heap, store in <code>acc</code></td>
+    </tr>
+    <tr>
+      <td><code>SetProperty</code></td>
+      <td>23</td>
+      <td><code>[name_idx] [obj_reg]</code></td>
+      <td>Set property <code>constants[name_idx]</code> on object in <code>obj_reg</code> to <code>acc</code></td>
+    </tr>
+    <tr>
+      <td><code>GetProperty</code></td>
+      <td>24</td>
+      <td><code>[name_idx] [obj_reg]</code></td>
+      <td>Load property <code>constants[name_idx]</code> from object in <code>obj_reg</code> into <code>acc</code></td>
+    </tr>
+  </tbody>
+</table>
+
+<pre><code>#[repr(u8)]
+pub enum ByteCode {
+    // ... existing opcodes 0&ndash;21 ...
+    CreateObject = 22,
+    SetProperty  = 23,
+    GetProperty  = 24,
+}</code></pre>
+
+<p>
+  <code>SetProperty</code> and <code>GetProperty</code> take two operands: a constant pool
+  index for the property name (a heap-allocated string), and a register holding the object
+  reference. The property name is always a string in the constant pool &mdash; not a register,
+  because property names are known at compile time.
+</p>
+
+<h2>New Tokens and AST</h2>
+
+<h3>Lexer tokens</h3>
+
+<p>
+  Object literals use <code>:</code> to separate keys from values.
+  Property access uses <code>.</code> for dot notation:
+</p>
+
+<pre><code>pub enum SymbolKind {
+    // ... existing variants ...
+    Dot,     // .
+    Colon,   // :
+}</code></pre>
+
+<h3>AST nodes</h3>
+
+<pre><code>pub enum Expr {
+    // ... existing variants ...
+    ObjectLit {
+        properties: Vec&lt;(String, Expr)&gt;,
+    },
+    PropertyAccess {
+        object: Box&lt;Expr&gt;,
+        property: String,
+    },
+}
+
+pub enum Stmt {
+    // ... existing variants ...
+    PropertyAssign {
+        object: String,       // variable name holding the object
+        property: String,     // property name
+        value: Expr,          // value to assign
+    },
+}</code></pre>
+
+<p>
+  <code>PropertyAssign</code> is simplified: the object is identified by a variable name
+  (not an arbitrary expression). This means <code>point.x = 10;</code> works, but
+  <code>getObj().x = 10;</code> doesn&rsquo;t. This is a pragmatic limitation &mdash;
+  supporting arbitrary left-hand-side expressions requires a more complex compilation
+  strategy that can be added later.
+</p>
+
+<h2>Parsing Objects</h2>
+
+<h3>Object literals</h3>
+
+<p>
+  When the parser sees <code>{</code> at the start of an expression (inside
+  <code>parse_factor</code>), it parses an object literal:
+</p>
+
+<pre><code>SymbolKind::LBrace => {
+    self.pop();  // consume {
+    let mut properties = Vec::new();
+    while self.peek() != SymbolKind::RBrace {
+        let key = self.expect(SymbolKind::Ident).str_val;
+        self.expect(SymbolKind::Colon);
+        let value = self.parse_expr();
+        properties.push((key, value));
+        if self.peek() == SymbolKind::Comma {
+            self.pop();
+        }
+    }
+    self.expect(SymbolKind::RBrace);
+    Expr::ObjectLit { properties }
+}</code></pre>
+
+<h3>Property access: dot notation</h3>
+
+<p>
+  After parsing a primary expression like an identifier, check for a trailing <code>.</code>:
+</p>
+
+<pre><code>// In parse_factor, after parsing an Ident:
+SymbolKind::Ident => {
+    let s = self.pop();
+    if self.peek() == SymbolKind::LPar {
+        // ... function call (existing) ...
+    } else if self.peek() == SymbolKind::Dot {
+        self.pop();  // consume .
+        let property = self.expect(SymbolKind::Ident).str_val;
+        Expr::PropertyAccess {
+            object: Box::new(Expr::Ident(s.str_val)),
+            property,
+        }
+    } else {
+        Expr::Ident(s.str_val)
+    }
+}</code></pre>
+
+<h3>Property assignment</h3>
+
+<p>
+  In <code>parse_expr_stmt</code>, extend the lookahead to detect <code>ident.ident = expr;</code>:
+</p>
+
+<pre><code>fn parse_expr_stmt(&amp;mut self) -> Stmt {
+    if self.peek() == SymbolKind::Ident {
+        // Check for property assignment: obj.prop = expr;
+        if self.pos + 2 &lt; self.syms.len()
+            &amp;&amp; self.syms[self.pos + 1].kind == SymbolKind::Dot
+            &amp;&amp; self.syms[self.pos + 2].kind == SymbolKind::Ident
+        {
+            // Peek further: is there an = after the property name?
+            if self.pos + 3 &lt; self.syms.len()
+                &amp;&amp; self.syms[self.pos + 3].kind == SymbolKind::Assign
+            {
+                let object = self.pop().str_val;
+                self.expect(SymbolKind::Dot);
+                let property = self.expect(SymbolKind::Ident).str_val;
+                self.expect(SymbolKind::Assign);
+                let value = self.parse_expr();
+                self.expect(SymbolKind::Semi);
+                return Stmt::PropertyAssign { object, property, value };
+            }
+        }
+        // ... existing assignment check ...
+    }
+    // ... existing expression statement ...
+}</code></pre>
+
+<p>
+  The lookahead checks four tokens ahead: <code>ident</code> <code>.</code>
+  <code>ident</code> <code>=</code>. This distinguishes property assignment from
+  property access used as an expression.
+</p>
+
+<h2>Compiling Object Literals</h2>
+
+<p>
+  An object literal <code>{ x: 10, y: 20 }</code> compiles to:
+</p>
+
+<ol>
+  <li>Emit <code>CreateObject</code> &mdash; allocates an empty JSObject, result in <code>acc</code>.</li>
+  <li>Store the object in a temp register.</li>
+  <li>For each property: compile the value expression, emit <code>SetProperty</code>
+      with the property name (from the constant pool) and the object register.</li>
+</ol>
+
+<pre><code>Expr::ObjectLit { properties } => {
+    // 1. Create empty object
+    self.code.push(ByteCode::CreateObject as u8);
+
+    // 2. Store object reference in a temp register
+    let obj_reg = self.alloc_reg();
+    self.code.push(ByteCode::Star as u8);
+    self.code.push(obj_reg as u8);
+
+    // 3. For each property, compile value and set it
+    for (key, value) in properties {
+        self.compile_expr(value, heap);
+
+        // Add property name string to constant pool
+        let name_val = heap.alloc_string(key);
+        let name_idx = self.constant_pool.len();
+        self.constant_pool.push(name_val);
+
+        self.code.push(ByteCode::SetProperty as u8);
+        self.code.push(name_idx as u8);
+        self.code.push(obj_reg as u8);
+    }
+
+    // 4. Leave the object in acc for the caller
+    self.code.push(ByteCode::Ldar as u8);
+    self.code.push(obj_reg as u8);
+}</code></pre>
+
+<p>
+  After compilation, the object sits in <code>acc</code>. If this is the right-hand side
+  of <code>let point = { ... };</code>, the enclosing <code>VarDecl</code> will
+  <code>Star</code> it into the variable&rsquo;s register.
+</p>
+
+<h2>Compiling Property Access</h2>
+
+<pre><code>Expr::PropertyAccess { object, property } => {
+    // Compile the object expression (puts object ref in acc)
+    self.compile_expr(object, heap);
+    let obj_reg = self.alloc_reg();
+    self.code.push(ByteCode::Star as u8);
+    self.code.push(obj_reg as u8);
+
+    // Property name goes in constant pool
+    let name_val = heap.alloc_string(property);
+    let name_idx = self.constant_pool.len();
+    self.constant_pool.push(name_val);
+
+    // Emit GetProperty
+    self.code.push(ByteCode::GetProperty as u8);
+    self.code.push(name_idx as u8);
+    self.code.push(obj_reg as u8);
+}</code></pre>
+
+<h2>Compiling Property Assignment</h2>
+
+<pre><code>Stmt::PropertyAssign { object, property, value } => {
+    // Compile the value expression
+    self.compile_expr(value, heap);
+
+    // Look up the object's register
+    let obj_reg = self.symbols[object];
+
+    // Property name in constant pool
+    let name_val = heap.alloc_string(property);
+    let name_idx = self.constant_pool.len();
+    self.constant_pool.push(name_val);
+
+    // Emit SetProperty
+    self.code.push(ByteCode::SetProperty as u8);
+    self.code.push(name_idx as u8);
+    self.code.push(obj_reg as u8);
+}</code></pre>
+
+<h2>VM Handlers</h2>
+
+<p>
+  The Heap needs three new methods:
+</p>
+
+<pre><code>impl Heap {
+    pub fn read_object(&amp;self, val: Value) -> &amp;JSObject {
+        match &amp;self.objects[val.heap_offset()] {
+            Some(HeapObject::Object(o)) => o,
+            other => panic!("expected Object, got {:?}", other),
+        }
+    }
+
+    pub fn get_property(&amp;self, obj_val: Value, name: &amp;str) -> Value {
+        let obj = self.read_object(obj_val);
+        *obj.properties.get(name)
+            .unwrap_or_else(|| panic!("property '{}' not found", name))
+    }
+
+    pub fn set_property(&amp;mut self, obj_val: Value, name: String, value: Value) {
+        match &amp;mut self.objects[obj_val.heap_offset()] {
+            Some(HeapObject::Object(o)) => {
+                o.properties.insert(name, value);
+            }
+            other => panic!("expected Object, got {:?}", other),
+        }
+    }
+}</code></pre>
+
+<p>And the bytecode dispatch:</p>
+
+<pre><code>ByteCode::CreateObject => {
+    self.acc = self.heap.alloc(HeapObject::Object(JSObject {
+        properties: HashMap::new(),
+    }));
+}
+
+ByteCode::SetProperty => {
+    let name_idx = call_stack.frames[fi].read_byte() as usize;
+    call_stack.frames[fi].pc += 1;
+    let obj_reg = call_stack.frames[fi].read_byte() as usize;
+    call_stack.frames[fi].pc += 1;
+
+    let name_val = call_stack.frames[fi].read_constant(name_idx);
+    let name = self.heap.read_string(name_val).to_string();
+    let obj_val = call_stack.reg(fi, obj_reg);
+    self.heap.set_property(obj_val, name, self.acc);
+}
+
+ByteCode::GetProperty => {
+    let name_idx = call_stack.frames[fi].read_byte() as usize;
+    call_stack.frames[fi].pc += 1;
+    let obj_reg = call_stack.frames[fi].read_byte() as usize;
+    call_stack.frames[fi].pc += 1;
+
+    let name_val = call_stack.frames[fi].read_constant(name_idx);
+    let name = self.heap.read_string(name_val);
+    let obj_val = call_stack.reg(fi, obj_reg);
+    self.acc = self.heap.get_property(obj_val, name);
+}</code></pre>
+
+<div class="quiz" data-correct="1"
+     data-right="Correct! CreateObject allocates a JSObject on the heap and stores the heap pointer in acc. It's a tagged Value with bit 0 = 1, pointing to the new object's index in the heap's objects array."
+     data-wrong="Think about how heap allocation works. What does heap.alloc() return? And where does the VM put the result of any operation that produces a value?">
+  <div class="quiz-question">
+    What does <code>CreateObject</code> leave in the accumulator?
+  </div>
+  <div class="quiz-options">
+    <div class="quiz-option">A Smi containing the object&rsquo;s property count</div>
+    <div class="quiz-option">A heap pointer (tagged Value) to the new empty JSObject</div>
+    <div class="quiz-option">The object&rsquo;s first property value</div>
+    <div class="quiz-option">A constant pool index referencing the object</div>
+  </div>
+  <div class="quiz-feedback"></div>
+</div>
+
+<h2>Worked Example</h2>
+
+<p>Source:</p>
+
+<pre><code>let point = { x: 10, y: 20 };
+let sum = point.x + point.y;</code></pre>
+
+<p>Compiled bytecode:</p>
+
+<pre><code>addr  instruction             effect
+&mdash;&mdash;&mdash;&mdash;  &mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;  &mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;
+                               ; let point = { x: 10, y: 20 };
+0000  CreateObject              acc = {} (empty JSObject on heap)
+0001  Star r0                   r0 = acc  (temp: object ref)
+
+0003  LdaSmi [0] (10)          acc = 10
+0005  SetProperty [1] r0        point["x"] = 10  ([1] = "x" in constant pool)
+
+0008  LdaSmi [2] (20)          acc = 20
+0010  SetProperty [3] r0        point["y"] = 20  ([3] = "y" in constant pool)
+
+0013  Ldar r0                   acc = point object
+0015  Star r1                   r1 = point  (var declaration register)
+
+                               ; let sum = point.x + point.y;
+0017  Ldar r1                   acc = point
+0019  Star r2                   r2 = point  (temp for GetProperty)
+0021  GetProperty [1] r2        acc = point.x = 10
+
+0024  Star r3                   r3 = 10  (stash for addition)
+
+0026  Ldar r1                   acc = point
+0028  Star r4                   r4 = point
+0030  GetProperty [3] r4        acc = point.y = 20
+
+0033  Add r3                    acc = 10 + 20 = 30
+0035  Star r5                   r5 = 30  (let sum = 30)
+</code></pre>
+
+<p>
+  Notice how property names <code>"x"</code> and <code>"y"</code> live in the constant pool
+  as heap-allocated strings (indices [1] and [3]). The same constant pool index is reused
+  when reading the property later &mdash; <code>SetProperty [1]</code> and
+  <code>GetProperty [1]</code> both refer to <code>"x"</code>.
+</p>
+
+<h2>GC: Tracing Through Objects</h2>
+
+<p>
+  Objects contain Values that may be heap pointers &mdash; a property could hold a string,
+  a closure, or another object. The garbage collector must trace into object properties:
+</p>
+
+<pre><code>fn mark(&amp;self, marked: &amp;mut Vec&lt;bool&gt;, val: Value) {
+    if !val.is_heap_object() { return; }
+    let idx = val.heap_offset();
+    if idx >= self.objects.len() || marked[idx] { return; }
+    marked[idx] = true;
+
+    match &amp;self.objects[idx] {
+        Some(HeapObject::String(_)) => {}
+        Some(HeapObject::Function(f)) => {
+            for &amp;v in &amp;f.constant_pool {
+                self.mark(marked, v);
+            }
+        }
+        Some(HeapObject::Closure(c)) => {
+            self.mark(marked, c.function);
+            for &amp;v in &amp;c.upvalues {
+                self.mark(marked, v);
+            }
+        }
+        Some(HeapObject::Object(o)) => {           // &larr; new
+            for &amp;v in o.properties.values() {
+                self.mark(marked, v);
+            }
+        }
+        None => {}
+    }
+}</code></pre>
+
+<p>
+  Without this, any object held as a property value would be collected prematurely.
+  Consider:
+</p>
+
+<pre><code>let inner = { value: 42 };
+let outer = { child: inner };
+// inner is no longer in a register &mdash; only reachable through outer.child
+// GC must trace: outer &rarr; properties &rarr; "child" &rarr; inner</code></pre>
+
+<div class="quiz" data-correct="0"
+     data-right="Correct! The GC traces root → outer (JSObject) → properties → 'child' value → inner (JSObject) → properties → 'value' → Smi(42). Without tracing into object properties, inner would be collected as unreachable."
+     data-wrong="Think about what's reachable from the root. The root points to outer. Outer's property map contains a Value pointing to inner. If the GC doesn't look inside the property map, how would it know inner is still alive?">
+  <div class="quiz-question">
+    An object <code>outer</code> has a property <code>child</code> pointing to another object
+    <code>inner</code>. The variable <code>inner</code> is no longer in any register.
+    How does the GC know <code>inner</code> is still alive?
+  </div>
+  <div class="quiz-options">
+    <div class="quiz-option">It traces outer&rsquo;s properties and follows the Value pointing to inner</div>
+    <div class="quiz-option">The VM maintains a separate list of all objects</div>
+    <div class="quiz-option">Objects are never garbage collected</div>
+    <div class="quiz-option">inner is collected &mdash; this is a known limitation</div>
+  </div>
+  <div class="quiz-feedback"></div>
+</div>
+
+<h2>How V8 Does It: Hidden Classes</h2>
+
+<p>
+  Our <code>HashMap&lt;String, Value&gt;</code> is correct but slow. Every property access
+  hashes the property name and probes the map. V8 solves this with
+  <strong>hidden classes</strong> (internally called <strong>Maps</strong>):
+</p>
+
+<pre><code>// Two objects with the same shape share one hidden class:
+let a = { x: 1, y: 2 };  // hidden class: Map{ x: offset 0, y: offset 1 }
+let b = { x: 3, y: 4 };  // same hidden class &mdash; shared!
+
+// Property access compiles to a fixed offset:
+// a.x &rarr; load a[offset 0]  (no hash lookup)</code></pre>
+
+<p>
+  A hidden class is a <strong>property layout descriptor</strong>. It maps property names to
+  fixed offsets in a dense array. Objects with the same set of properties in the same order
+  share the same hidden class. Property access becomes an array index instead of a hash lookup.
+</p>
+
+<table class="ref-table">
+  <thead>
+    <tr><th>Aspect</th><th>g8 (HashMap)</th><th>V8 (Hidden Classes)</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Property storage</td><td><code>HashMap&lt;String, Value&gt;</code></td><td>Dense <code>Vec&lt;Value&gt;</code> + Map pointer</td></tr>
+    <tr><td>Property read</td><td>Hash lookup &mdash; O(1) average</td><td>Fixed offset &mdash; O(1) worst case</td></tr>
+    <tr><td>Memory per object</td><td>HashMap overhead (~72 bytes empty)</td><td>Values array + 1 pointer to Map</td></tr>
+    <tr><td>Shape sharing</td><td>None &mdash; each object owns its map</td><td>Same-shape objects share a Map</td></tr>
+    <tr><td>Inline caches</td><td>None</td><td>IC caches the Map + offset for fast repeat access</td></tr>
+    <tr><td>Adding a property</td><td><code>HashMap::insert</code></td><td>Transition to a new Map (creates a transition tree)</td></tr>
+  </tbody>
+</table>
+
+<div class="callout">
+  <strong>V8 parallel:</strong> V8&rsquo;s <code>GetNamedProperty</code> bytecode is our
+  <code>GetProperty</code>. V8&rsquo;s <code>SetNamedProperty</code> is our
+  <code>SetProperty</code>. V8&rsquo;s <code>CreateObjectLiteral</code> uses a
+  <strong>boilerplate</strong> &mdash; a pre-built template object that gets shallow-cloned,
+  avoiding the create-then-set-each-property dance. Our <code>CreateObject</code> +
+  per-property <code>SetProperty</code> sequence is the na&iuml;ve version.
+</div>
+
+<div class="quiz" data-correct="1"
+     data-right="Correct! Hidden classes (Maps) map property names to fixed array offsets. Objects with the same shape share one Map. Property access becomes a direct array index — no hashing. This also enables inline caches, where the VM remembers which Map was seen at a call site and skips the lookup entirely on repeat access."
+     data-wrong="Think about what's slow in our implementation. Every `obj.x` hashes the string 'x' and probes the HashMap. How could you turn that into a constant-time array index?">
+  <div class="quiz-question">
+    Why does V8 use hidden classes instead of HashMaps for object properties?
+  </div>
+  <div class="quiz-options">
+    <div class="quiz-option">HashMaps aren&rsquo;t supported in C++</div>
+    <div class="quiz-option">Hidden classes turn property access into a fixed-offset array read &mdash; faster and cache-friendly</div>
+    <div class="quiz-option">Hidden classes use less memory by storing property names inline</div>
+    <div class="quiz-option">The JavaScript spec requires hidden classes</div>
+  </div>
+  <div class="quiz-feedback"></div>
+</div>
+
+<h2>Implementation Steps</h2>
+
+<ol>
+  <li><strong>Lexer:</strong> Add <code>Dot</code> and <code>Colon</code> to
+    <code>SymbolKind</code>. Recognize <code>.</code> and <code>:</code> in the
+    lexer match.</li>
+  <li><strong>AST:</strong> Add <code>Expr::ObjectLit</code>,
+    <code>Expr::PropertyAccess</code>, and <code>Stmt::PropertyAssign</code>.
+    Add <code>Display</code> for each.</li>
+  <li><strong>Parser:</strong>
+    <ul>
+      <li><code>parse_factor</code>: handle <code>LBrace</code> for object literals,
+        and <code>Dot</code> after identifiers for property access.</li>
+      <li><code>parse_expr_stmt</code>: detect <code>ident.ident = expr;</code>
+        for property assignment (4-token lookahead).</li>
+    </ul>
+  </li>
+  <li><strong>Bytecodes:</strong> Add <code>CreateObject = 22</code>,
+    <code>SetProperty = 23</code>, <code>GetProperty = 24</code> to the enum,
+    <code>From&lt;u8&gt;</code>, and <code>Display</code>.</li>
+  <li><strong>Heap:</strong> Add <code>JSObject</code> struct and
+    <code>HeapObject::Object</code> variant. Add <code>read_object</code>,
+    <code>get_property</code>, <code>set_property</code> methods.</li>
+  <li><strong>Compiler:</strong>
+    <ul>
+      <li><code>ObjectLit</code>: emit <code>CreateObject</code>, store in temp reg,
+        compile each property value + <code>SetProperty</code>, reload object into acc.</li>
+      <li><code>PropertyAccess</code>: compile object expr, store in temp reg,
+        emit <code>GetProperty</code>.</li>
+      <li><code>PropertyAssign</code>: compile value, look up object register,
+        emit <code>SetProperty</code>.</li>
+    </ul>
+  </li>
+  <li><strong>VM:</strong> Add handlers for the three new bytecodes.</li>
+  <li><strong>GC:</strong> Update <code>mark</code> to trace <code>JSObject</code> property
+    values.</li>
+  <li><strong>Test:</strong>
+    <pre style="display:inline"><code>let p = { x: 10, y: 20 }; p.x + p.y;</code></pre>
+    &rarr; <code>30</code>.
+    <br>
+    <pre style="display:inline"><code>let p = { x: 1 }; p.x = 99; p.x;</code></pre>
+    &rarr; <code>99</code>.
+  </li>
+</ol>
+
+<div class="callout warn">
+  <strong>Watch out for register allocation in object literals.</strong> Each
+  <code>SetProperty</code> needs the object in a register, but compiling the property
+  value may use the accumulator. Make sure you <code>Star</code> the object reference
+  into a register <em>before</em> compiling property values, and reload it into
+  <code>acc</code> at the end so the enclosing expression gets the object, not the last
+  property value.
+</div>
+
+<h2>Check Your Understanding</h2>
+
+<div class="quiz" data-correct="2"
+     data-right="Correct! The object literal compiles to: CreateObject, Star r_tmp, then for each property: compile value, SetProperty [name] r_tmp. Finally Ldar r_tmp to put the object back in acc. The compiler uses the same constant pool entry for a property name during both SetProperty and GetProperty."
+     data-wrong="Think about the steps: you need an empty object first, then you need to add each property. The object must be in a register so SetProperty can find it. What's the sequence?">
+  <div class="quiz-question">
+    How does the compiler handle <code>let obj = { a: 1, b: 2 };</code>?
+  </div>
+  <div class="quiz-options">
+    <div class="quiz-option">Emits a single CreateObjectWithProperties bytecode</div>
+    <div class="quiz-option">Creates the object in the constant pool at compile time</div>
+    <div class="quiz-option">CreateObject, then SetProperty for each key&ndash;value pair</div>
+    <div class="quiz-option">Allocates one register per property name</div>
+  </div>
+  <div class="quiz-feedback"></div>
+</div>
+
+<h2>What This Unlocks</h2>
+
+<p>With objects, your VM can express:</p>
+
+<ul>
+  <li><strong>Structured data:</strong> <code>let user = { name: "alice", age: 30 };</code></li>
+  <li><strong>Nested objects:</strong> <code>let rect = { origin: { x: 0, y: 0 }, width: 100 };</code></li>
+  <li><strong>Mutable state:</strong> <code>point.x = point.x + 1;</code></li>
+  <li><strong>Object-passing:</strong> pass objects to functions, return objects from functions</li>
+</ul>
+
+<p>Still missing (future lessons):</p>
+<ul>
+  <li><strong>Arrays:</strong> dense indexed collections &mdash; a specialized object
+    with integer keys and <code>length</code></li>
+  <li><strong>Hidden classes:</strong> replace HashMap with offset-based property
+    access for performance</li>
+  <li><strong>Prototypes:</strong> prototype chains for method sharing and inheritance</li>
+  <li><strong><code>this</code>:</strong> method calls that bind the receiver object</li>
+  <li><strong>Computed property access:</strong> <code>obj[expr]</code> instead of
+    just <code>obj.name</code></li>
+</ul>
+
+<h2>Primary Sources</h2>
+
+<p>
+  <a href="https://craftinginterpreters.com/classes-and-instances.html">Crafting Interpreters,
+  Ch.&nbsp;27</a> implements classes and instances with a property HashMap &mdash; the same
+  approach used here. For V8&rsquo;s object model, see
+  <code>src/objects/js-object.h</code> (<code>JSObject</code>),
+  <code>src/objects/map.h</code> (hidden classes), and the
+  <a href="https://v8.dev/blog/fast-properties">Fast properties in V8</a> blog post for
+  a deep dive into how hidden classes, inline caches, and property storage interact.
+</p>
+
+<nav class="lesson-nav">
+  <a href="0012-for-loops.html">&larr; Lesson 12: For Loops</a>
+  <a href="../reference/bytecode-instruction-set.html">Reference &rarr;</a>
+</nav>
+
+<footer>
+  Questions about anything in this lesson? Ask your agent &mdash; that&rsquo;s what it&rsquo;s here for.
+  <br><br>
+  g8 teaching workspace &middot;
+  <a href="0001-ast-to-stack-bytecode.html">Lesson 1</a> &middot;
+  <a href="0002-building-the-vm.html">Lesson 2</a> &middot;
+  <a href="0003-the-accumulator-model.html">Lesson 3</a> &middot;
+  <a href="0004-variables.html">Lesson 4</a> &middot;
+  <a href="0005-functions-and-call-frames.html">Lesson 5</a> &middot;
+  <a href="0006-control-flow.html">Lesson 6</a> &middot;
+  <a href="0007-tagged-values-and-the-heap.html">Lesson 7</a> &middot;
+  <a href="0008-garbage-collection.html">Lesson 8</a> &middot;
+  <a href="0009-the-isolate.html">Lesson 9</a> &middot;
+  <a href="0010-closures-functions-on-the-heap.html">Lesson 10</a> &middot;
+  <a href="0011-while-loops.html">Lesson 11</a> &middot;
+  <a href="0012-for-loops.html">Lesson 12</a> &middot;
+  <a href="0013-objects.html">Lesson 13</a> &middot;
+  <a href="../reference/bytecode-instruction-set.html">Instruction Set Reference</a>
+</footer>
+
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

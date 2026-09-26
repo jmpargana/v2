@@ -34,6 +34,7 @@ pub enum SymbolKind {
     Else,
     Str,
     While,
+    For,
 }
 
 impl fmt::Display for SymbolKind {
@@ -71,6 +72,7 @@ impl fmt::Display for SymbolKind {
             SymbolKind::Else => write!(f, "ELSE"),
             SymbolKind::Str => write!(f, "STRING"),
             SymbolKind::While => write!(f, "while"),
+            SymbolKind::For => write!(f, "for"),
         }
     }
 }
@@ -331,6 +333,11 @@ impl Lexer {
                         }),
                         "while" => res.push(Symbol {
                             kind: SymbolKind::While,
+                            int_val: None,
+                            str_val: String::new(),
+                        }),
+                        "for" => res.push(Symbol {
+                            kind: SymbolKind::For,
                             int_val: None,
                             str_val: String::new(),
                         }),

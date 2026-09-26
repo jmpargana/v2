@@ -96,6 +96,12 @@ pub enum Stmt {
         condition: Expr,
         body: Vec<Stmt>,
     },
+    ForLoop {
+        init: Box<Stmt>,
+        condition: Expr,
+        body: Vec<Stmt>,
+        update: Box<Stmt>,
+    },
     Assign {
         name: String,
         value: Expr,
@@ -139,6 +145,18 @@ impl fmt::Display for Stmt {
             }
             Stmt::WhileLoop { condition, body } => {
                 write!(f, "while ({}) {{", condition)?;
+                for s in body {
+                    write!(f, " {}", s)?;
+                }
+                write!(f, " }}")
+            }
+            Stmt::ForLoop {
+                init,
+                condition,
+                body,
+                update,
+            } => {
+                write!(f, "for ({}; {}; {}) {{", init, condition, update)?;
                 for s in body {
                     write!(f, " {}", s)?;
                 }
