@@ -48,10 +48,28 @@ impl Parser {
         match self.peek() {
             SymbolKind::Let | SymbolKind::Const | SymbolKind::Var => self.parse_var_decl(),
             SymbolKind::If => self.parse_conditional(),
+            SymbolKind::While => self.parse_while_loop(),
             SymbolKind::Function => self.parse_func_decl(),
             SymbolKind::Return => self.parse_return_stmt(),
             _ => self.parse_expr_stmt(),
         }
+    }
+
+    fn parse_while_loop(&mut self) -> Stmt {
+        self.expect(SymbolKind::While);
+
+        self.expect(SymbolKind::LPar);
+        let condition = self.parse_expr();
+        self.expect(SymbolKind::RPar);
+
+        self.expect(SymbolKind::LBrace);
+        let mut body = Vec::new();
+        while self.peek() != SymbolKind::RBrace {
+            body.push(self.parse_stmt());
+        }
+        self.expect(SymbolKind::RBrace);
+
+        Stmt::WhileLoop { condition, body }
     }
 
     fn parse_conditional(&mut self) -> Stmt {
@@ -126,6 +144,13 @@ impl Parser {
     }
 
     fn parse_expr_stmt(&mut self) -> Stmt {
+        if self.peek() == SymbolKind::Ident && self.pos + 1 < self.syms.len() && self.syms[self.pos + 1].kind == SymbolKind::Assign {
+            let name = self.pop().str_val;
+            self.expect(SymbolKind::Assign);
+            let value = self.parse_expr();
+            self.expect(SymbolKind::Semi);
+            return Stmt::Assign { name, value };
+        }
         let expr = self.parse_expr();
         self.expect(SymbolKind::Semi);
         Stmt::ExprStmt(expr)

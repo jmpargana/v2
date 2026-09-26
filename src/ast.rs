@@ -92,6 +92,14 @@ pub enum Stmt {
         params: Vec<String>,
         body: Vec<Stmt>,
     },
+    WhileLoop {
+        condition: Expr,
+        body: Vec<Stmt>,
+    },
+    Assign {
+        name: String,
+        value: Expr,
+    },
     Return(Expr),
     ExprStmt(Expr),
 }
@@ -107,6 +115,7 @@ impl fmt::Display for Stmt {
                 }
                 write!(f, " }}")
             }
+            Stmt::Assign { name, value } => write!(f, "{} = {};", name, value),
             Stmt::Return(value) => write!(f, "return {};", value),
             Stmt::ExprStmt(expr) => write!(f, "{};", expr),
             Stmt::Cond {
@@ -127,6 +136,13 @@ impl fmt::Display for Stmt {
                     write!(f, " }}")?;
                 }
                 Ok(())
+            }
+            Stmt::WhileLoop { condition, body } => {
+                write!(f, "while ({}) {{", condition)?;
+                for s in body {
+                    write!(f, " {}", s)?;
+                }
+                write!(f, " }}")
             }
         }
     }

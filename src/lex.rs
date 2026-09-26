@@ -33,6 +33,7 @@ pub enum SymbolKind {
     If,
     Else,
     Str,
+    While,
 }
 
 impl fmt::Display for SymbolKind {
@@ -69,6 +70,7 @@ impl fmt::Display for SymbolKind {
             SymbolKind::If => write!(f, "IF"),
             SymbolKind::Else => write!(f, "ELSE"),
             SymbolKind::Str => write!(f, "STRING"),
+            SymbolKind::While => write!(f, "while"),
         }
     }
 }
@@ -327,6 +329,11 @@ impl Lexer {
                             int_val: None,
                             str_val: String::new(),
                         }),
+                        "while" => res.push(Symbol {
+                            kind: SymbolKind::While,
+                            int_val: None,
+                            str_val: String::new(),
+                        }),
                         "function" => res.push(Symbol {
                             kind: SymbolKind::Function,
                             int_val: None,
@@ -482,10 +489,7 @@ mod tests {
 
     #[test]
     fn string_literal_with_spaces() {
-        assert_eq!(
-            Lexer::lex("\"hello world\""),
-            vec![str_lit("hello world")]
-        );
+        assert_eq!(Lexer::lex("\"hello world\""), vec![str_lit("hello world")]);
     }
 
     #[test]

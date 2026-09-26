@@ -45,6 +45,19 @@ function max(a, b) {
   if (a > b) { return a; } else { return b; }
 }
 
+// While loops
+var i = 10;
+var result = 1;
+while (i > 0) {
+    result = result * i;
+    i = i - 1;
+}
+result;
+
+// Variable reassignment
+let x = 10;
+x = x + 1;
+
 // Comparison operators: <, >, <=, >=, ==, !=
 // Logical operators: &&, ||, !
 // Nested function calls
@@ -56,7 +69,8 @@ function sum_of_squares(a, b) {
 ## What's missing compared to real V8
 
 ### Language features
-- Loops (`for`, `while`, `do-while`, `for-in`, `for-of`)
+- `while` loops and variable reassignment (**done**)
+- Other loops (`for`, `do-while`, `for-in`, `for-of`)
 - Objects, prototypes, and property access
 - Arrays
 - Classes and `this`

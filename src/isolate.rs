@@ -65,7 +65,10 @@ impl Frame {
 
     #[inline(always)]
     fn read_constant(&self, idx: usize) -> Value {
-        assert!(idx < self.constants_len, "constant pool index out of bounds");
+        assert!(
+            idx < self.constants_len,
+            "constant pool index out of bounds"
+        );
         // SAFETY: idx < constants_len verified above, pointer valid per Frame::new
         unsafe { *self.constants.add(idx) }
     }
@@ -260,12 +263,11 @@ impl Isolate {
                     let idx = call_stack.frames[fi].read_byte() as usize;
                     call_stack.frames[fi].pc += 1;
                     if self.acc.is_smi() {
-                        self.acc =
-                            if self.acc.as_smi() == call_stack.reg(fi, idx).as_smi() {
-                                Value::from_smi(1)
-                            } else {
-                                Value::from_smi(0)
-                            };
+                        self.acc = if self.acc.as_smi() == call_stack.reg(fi, idx).as_smi() {
+                            Value::from_smi(1)
+                        } else {
+                            Value::from_smi(0)
+                        };
                     } else {
                         let a = self.heap.read_string(self.acc);
                         let b = self.heap.read_string(call_stack.reg(fi, idx));
@@ -359,6 +361,11 @@ impl Isolate {
                         call_stack.frames[fi].pc += offset as usize;
                     }
                 }
+                ByteCode::JumpLoop => {
+                    let offset = call_stack.frames[fi].read_byte();
+                    call_stack.frames[fi].pc += 1;
+                    call_stack.frames[fi].pc -= offset as usize;
+                }
             }
         }
 
@@ -410,15 +417,26 @@ mod tests {
         let closure = make_closure(
             &mut heap,
             vec![
-                ByteCode::LdaSmi as u8, 0,
-                ByteCode::Star as u8, 0,
-                ByteCode::LdaSmi as u8, 1,
-                ByteCode::Star as u8, 1,
-                ByteCode::LdaSmi as u8, 2,
-                ByteCode::Mul as u8, 1,
-                ByteCode::Add as u8, 0,
+                ByteCode::LdaSmi as u8,
+                0,
+                ByteCode::Star as u8,
+                0,
+                ByteCode::LdaSmi as u8,
+                1,
+                ByteCode::Star as u8,
+                1,
+                ByteCode::LdaSmi as u8,
+                2,
+                ByteCode::Mul as u8,
+                1,
+                ByteCode::Add as u8,
+                0,
             ],
-            vec![Value::from_smi(30), Value::from_smi(20), Value::from_smi(40)],
+            vec![
+                Value::from_smi(30),
+                Value::from_smi(20),
+                Value::from_smi(40),
+            ],
             0,
         );
         let mut iso = Isolate::with_heap(heap, 1024);
@@ -432,10 +450,14 @@ mod tests {
         let child = make_closure(
             &mut heap,
             vec![
-                ByteCode::Ldar as u8, 0,
-                ByteCode::Star as u8, 2,
-                ByteCode::Ldar as u8, 1,
-                ByteCode::Add as u8, 2,
+                ByteCode::Ldar as u8,
+                0,
+                ByteCode::Star as u8,
+                2,
+                ByteCode::Ldar as u8,
+                1,
+                ByteCode::Add as u8,
+                2,
                 ByteCode::Return as u8,
             ],
             vec![],
@@ -445,13 +467,21 @@ mod tests {
         let closure = make_closure(
             &mut heap,
             vec![
-                ByteCode::LdaSmi as u8, 0,
-                ByteCode::Star as u8, 0,
-                ByteCode::LdaSmi as u8, 1,
-                ByteCode::Star as u8, 1,
-                ByteCode::LdaSmi as u8, 2,
-                ByteCode::Star as u8, 2,
-                ByteCode::Call as u8, 0, 3,
+                ByteCode::LdaSmi as u8,
+                0,
+                ByteCode::Star as u8,
+                0,
+                ByteCode::LdaSmi as u8,
+                1,
+                ByteCode::Star as u8,
+                1,
+                ByteCode::LdaSmi as u8,
+                2,
+                ByteCode::Star as u8,
+                2,
+                ByteCode::Call as u8,
+                0,
+                3,
             ],
             vec![child, Value::from_smi(10), Value::from_smi(20)],
             0,
@@ -467,10 +497,14 @@ mod tests {
         let closure = make_closure(
             &mut heap,
             vec![
-                ByteCode::LdaSmi as u8, 0,
-                ByteCode::Star as u8, 0,
-                ByteCode::LdaSmi as u8, 0,
-                ByteCode::TestEqual as u8, 0,
+                ByteCode::LdaSmi as u8,
+                0,
+                ByteCode::Star as u8,
+                0,
+                ByteCode::LdaSmi as u8,
+                0,
+                ByteCode::TestEqual as u8,
+                0,
             ],
             vec![Value::from_smi(42)],
             0,
@@ -485,10 +519,14 @@ mod tests {
         let closure = make_closure(
             &mut heap,
             vec![
-                ByteCode::LdaSmi as u8, 0,
-                ByteCode::Star as u8, 0,
-                ByteCode::LdaSmi as u8, 1,
-                ByteCode::TestEqual as u8, 0,
+                ByteCode::LdaSmi as u8,
+                0,
+                ByteCode::Star as u8,
+                0,
+                ByteCode::LdaSmi as u8,
+                1,
+                ByteCode::TestEqual as u8,
+                0,
             ],
             vec![Value::from_smi(1), Value::from_smi(2)],
             0,
@@ -503,10 +541,14 @@ mod tests {
         let closure = make_closure(
             &mut heap,
             vec![
-                ByteCode::LdaSmi as u8, 0,
-                ByteCode::Star as u8, 0,
-                ByteCode::LdaSmi as u8, 1,
-                ByteCode::TestLess as u8, 0,
+                ByteCode::LdaSmi as u8,
+                0,
+                ByteCode::Star as u8,
+                0,
+                ByteCode::LdaSmi as u8,
+                1,
+                ByteCode::TestLess as u8,
+                0,
             ],
             vec![Value::from_smi(5), Value::from_smi(10)],
             0,
@@ -521,10 +563,14 @@ mod tests {
         let closure = make_closure(
             &mut heap,
             vec![
-                ByteCode::LdaSmi as u8, 0,
-                ByteCode::Star as u8, 0,
-                ByteCode::LdaSmi as u8, 1,
-                ByteCode::TestGreater as u8, 0,
+                ByteCode::LdaSmi as u8,
+                0,
+                ByteCode::Star as u8,
+                0,
+                ByteCode::LdaSmi as u8,
+                1,
+                ByteCode::TestGreater as u8,
+                0,
             ],
             vec![Value::from_smi(10), Value::from_smi(5)],
             0,
@@ -552,10 +598,14 @@ mod tests {
         let closure = make_closure(
             &mut heap,
             vec![
-                ByteCode::LdaSmi as u8, 0,
-                ByteCode::Star as u8, 0,
-                ByteCode::LdaSmi as u8, 0,
-                ByteCode::LogicalAnd as u8, 0,
+                ByteCode::LdaSmi as u8,
+                0,
+                ByteCode::Star as u8,
+                0,
+                ByteCode::LdaSmi as u8,
+                0,
+                ByteCode::LogicalAnd as u8,
+                0,
             ],
             vec![Value::from_smi(1)],
             0,
@@ -570,10 +620,14 @@ mod tests {
         let closure = make_closure(
             &mut heap,
             vec![
-                ByteCode::LdaSmi as u8, 0,
-                ByteCode::Star as u8, 0,
-                ByteCode::LdaSmi as u8, 1,
-                ByteCode::LogicalOr as u8, 0,
+                ByteCode::LdaSmi as u8,
+                0,
+                ByteCode::Star as u8,
+                0,
+                ByteCode::LdaSmi as u8,
+                1,
+                ByteCode::LogicalOr as u8,
+                0,
             ],
             vec![Value::from_smi(1), Value::from_smi(0)],
             0,
@@ -588,9 +642,12 @@ mod tests {
         let closure = make_closure(
             &mut heap,
             vec![
-                ByteCode::LdaSmi as u8, 0,
-                ByteCode::JumpIfFalse as u8, 2,
-                ByteCode::LdaSmi as u8, 1,
+                ByteCode::LdaSmi as u8,
+                0,
+                ByteCode::JumpIfFalse as u8,
+                2,
+                ByteCode::LdaSmi as u8,
+                1,
             ],
             vec![Value::from_smi(0), Value::from_smi(99)],
             0,
@@ -605,9 +662,12 @@ mod tests {
         let closure = make_closure(
             &mut heap,
             vec![
-                ByteCode::LdaSmi as u8, 0,
-                ByteCode::JumpIfFalse as u8, 2,
-                ByteCode::LdaSmi as u8, 1,
+                ByteCode::LdaSmi as u8,
+                0,
+                ByteCode::JumpIfFalse as u8,
+                2,
+                ByteCode::LdaSmi as u8,
+                1,
             ],
             vec![Value::from_smi(1), Value::from_smi(99)],
             0,
@@ -624,10 +684,14 @@ mod tests {
         let closure = make_closure(
             &mut heap,
             vec![
-                ByteCode::LdaSmi as u8, 0,
-                ByteCode::Star as u8, 0,
-                ByteCode::LdaSmi as u8, 1,
-                ByteCode::TestEqual as u8, 0,
+                ByteCode::LdaSmi as u8,
+                0,
+                ByteCode::Star as u8,
+                0,
+                ByteCode::LdaSmi as u8,
+                1,
+                ByteCode::TestEqual as u8,
+                0,
             ],
             vec![a, b],
             0,
@@ -644,10 +708,14 @@ mod tests {
         let closure = make_closure(
             &mut heap,
             vec![
-                ByteCode::LdaSmi as u8, 0,
-                ByteCode::Star as u8, 0,
-                ByteCode::LdaSmi as u8, 1,
-                ByteCode::TestEqual as u8, 0,
+                ByteCode::LdaSmi as u8,
+                0,
+                ByteCode::Star as u8,
+                0,
+                ByteCode::LdaSmi as u8,
+                1,
+                ByteCode::TestEqual as u8,
+                0,
             ],
             vec![a, b],
             0,
@@ -662,10 +730,14 @@ mod tests {
         let closure = make_closure(
             &mut heap,
             vec![
-                ByteCode::LdaSmi as u8, 0,
-                ByteCode::Star as u8, 0,
-                ByteCode::LdaSmi as u8, 1,
-                ByteCode::Sub as u8, 0,
+                ByteCode::LdaSmi as u8,
+                0,
+                ByteCode::Star as u8,
+                0,
+                ByteCode::LdaSmi as u8,
+                1,
+                ByteCode::Sub as u8,
+                0,
             ],
             vec![Value::from_smi(10), Value::from_smi(3)],
             0,
@@ -680,10 +752,14 @@ mod tests {
         let closure = make_closure(
             &mut heap,
             vec![
-                ByteCode::LdaSmi as u8, 0,
-                ByteCode::Star as u8, 0,
-                ByteCode::LdaSmi as u8, 1,
-                ByteCode::Div as u8, 0,
+                ByteCode::LdaSmi as u8,
+                0,
+                ByteCode::Star as u8,
+                0,
+                ByteCode::LdaSmi as u8,
+                1,
+                ByteCode::Div as u8,
+                0,
             ],
             vec![Value::from_smi(20), Value::from_smi(4)],
             0,
@@ -700,10 +776,14 @@ mod tests {
         let closure = make_closure(
             &mut heap,
             vec![
-                ByteCode::LdaSmi as u8, 0,
-                ByteCode::Star as u8, 0,
-                ByteCode::LdaSmi as u8, 1,
-                ByteCode::Add as u8, 0,
+                ByteCode::LdaSmi as u8,
+                0,
+                ByteCode::Star as u8,
+                0,
+                ByteCode::LdaSmi as u8,
+                1,
+                ByteCode::Add as u8,
+                0,
             ],
             vec![a, b],
             0,
@@ -722,15 +802,24 @@ mod tests {
         let closure = make_closure(
             &mut heap,
             vec![
-                ByteCode::LdaSmi as u8, 0,
-                ByteCode::Star as u8, 0,
-                ByteCode::LdaSmi as u8, 1,
-                ByteCode::Add as u8, 0,
-                ByteCode::Star as u8, 0,
-                ByteCode::LdaSmi as u8, 0,
-                ByteCode::Star as u8, 0,
-                ByteCode::LdaSmi as u8, 1,
-                ByteCode::Add as u8, 0,
+                ByteCode::LdaSmi as u8,
+                0,
+                ByteCode::Star as u8,
+                0,
+                ByteCode::LdaSmi as u8,
+                1,
+                ByteCode::Add as u8,
+                0,
+                ByteCode::Star as u8,
+                0,
+                ByteCode::LdaSmi as u8,
+                0,
+                ByteCode::Star as u8,
+                0,
+                ByteCode::LdaSmi as u8,
+                1,
+                ByteCode::Add as u8,
+                0,
             ],
             vec![a, b],
             0,

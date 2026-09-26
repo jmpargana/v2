@@ -1,5 +1,5 @@
 use crate::ast::{Expr, Op, Stmt};
-use crate::heap::{BytecodeFunction, Heap, Closure, HeapObject, HeapString};
+use crate::heap::{BytecodeFunction, Closure, Heap, HeapObject, HeapString};
 use crate::value::Value;
 use std::collections::HashMap;
 use std::fmt::{self, Write};
@@ -28,6 +28,7 @@ pub enum ByteCode {
     LogicalAnd = 18,
     LogicalOr = 19,
     LogicalNot = 20,
+    JumpLoop = 21,
 }
 
 impl From<u8> for ByteCode {
@@ -54,6 +55,7 @@ impl From<u8> for ByteCode {
             18 => ByteCode::LogicalAnd,
             19 => ByteCode::LogicalOr,
             20 => ByteCode::LogicalNot,
+            21 => ByteCode::JumpLoop,
             _ => panic!("Unknown({})", val),
         }
     }
@@ -83,6 +85,7 @@ impl fmt::Display for ByteCode {
             ByteCode::LogicalAnd => write!(f, "LogicalAnd"),
             ByteCode::LogicalOr => write!(f, "LogicalOr"),
             ByteCode::LogicalNot => write!(f, "LogicalNot"),
+            ByteCode::JumpLoop => write!(f, "JumpLoop"),
         }
     }
 }
@@ -182,11 +185,8 @@ impl Compiler {
 
                 // Inject parent-scope closures for recursive and cross-scope calls
                 child.closures = self.closures.clone();
-                let mut parent_closures: Vec<(String, Value)> = self
-                    .closures
-                    .iter()
-                    .map(|(n, v)| (n.clone(), *v))
-                    .collect();
+                let mut parent_closures: Vec<(String, Value)> =
+                    self.closures.iter().map(|(n, v)| (n.clone(), *v)).collect();
                 parent_closures.sort_by(|a, b| a.0.cmp(&b.0));
                 for (fn_name, fn_val) in &parent_closures {
                     let cidx = child.constant_pool.len();
@@ -208,6 +208,12 @@ impl Compiler {
                     register_count: child.next_reg,
                 }));
                 heap.patch_closure(closure_val, real_func);
+            }
+            Stmt::Assign { name, value } => {
+                self.compile_expr(value, heap);
+                let reg = self.symbols[name];
+                self.code.push(ByteCode::Star as u8);
+                self.code.push(reg as u8);
             }
             Stmt::Return(value) => {
                 self.compile_expr(value, heap);
@@ -233,6 +239,15 @@ impl Compiler {
                     self.patch_jump(jump_false);
                 }
             }
+            Stmt::WhileLoop { condition, body } => {
+                let jump_loop_marker = self.code.len();
+                self.compile_expr(condition, heap);
+                let jump_false = self.emit_jump(ByteCode::JumpIfFalse);
+                self.compile_stmts(body, heap);
+                self.code.push(ByteCode::JumpLoop as u8);
+                self.code.push((self.code.len() + 1 - jump_loop_marker) as u8);
+                self.patch_jump(jump_false);
+            }
         }
     }
 
@@ -251,9 +266,10 @@ impl Compiler {
         match expr {
             Expr::StringLit(val) => {
                 let idx = self.constant_pool.len();
-                self.constant_pool.push(heap.alloc(HeapObject::String(HeapString {
-                    data: val.to_string(),
-                })));
+                self.constant_pool
+                    .push(heap.alloc(HeapObject::String(HeapString {
+                        data: val.to_string(),
+                    })));
                 self.code.push(ByteCode::LdaSmi as u8);
                 self.code.push(idx as u8);
             }
@@ -471,20 +487,34 @@ mod tests {
         assert_eq!(
             func.code,
             vec![
-                ByteCode::LdaSmi as u8, 0,
-                ByteCode::Star as u8, 0,
-                ByteCode::LdaSmi as u8, 1,
-                ByteCode::Star as u8, 1,
-                ByteCode::Ldar as u8, 0,
-                ByteCode::Add as u8, 1,
-                ByteCode::Star as u8, 2,
-                ByteCode::Ldar as u8, 0,
-                ByteCode::Star as u8, 3,
-                ByteCode::Ldar as u8, 2,
-                ByteCode::Mul as u8, 3,
+                ByteCode::LdaSmi as u8,
+                0,
+                ByteCode::Star as u8,
+                0,
+                ByteCode::LdaSmi as u8,
+                1,
+                ByteCode::Star as u8,
+                1,
+                ByteCode::Ldar as u8,
+                0,
+                ByteCode::Add as u8,
+                1,
+                ByteCode::Star as u8,
+                2,
+                ByteCode::Ldar as u8,
+                0,
+                ByteCode::Star as u8,
+                3,
+                ByteCode::Ldar as u8,
+                2,
+                ByteCode::Mul as u8,
+                3,
             ]
         );
-        assert_eq!(func.constant_pool, vec![Value::from_smi(10), Value::from_smi(20)]);
+        assert_eq!(
+            func.constant_pool,
+            vec![Value::from_smi(10), Value::from_smi(20)]
+        );
     }
 
     #[test]
@@ -512,13 +542,21 @@ mod tests {
         assert_eq!(
             func.code,
             vec![
-                ByteCode::LdaSmi as u8, 0,
-                ByteCode::Star as u8, 0,
-                ByteCode::LdaSmi as u8, 1,
-                ByteCode::Star as u8, 1,
-                ByteCode::LdaSmi as u8, 2,
-                ByteCode::Star as u8, 2,
-                ByteCode::Call as u8, 0, 3,
+                ByteCode::LdaSmi as u8,
+                0,
+                ByteCode::Star as u8,
+                0,
+                ByteCode::LdaSmi as u8,
+                1,
+                ByteCode::Star as u8,
+                1,
+                ByteCode::LdaSmi as u8,
+                2,
+                ByteCode::Star as u8,
+                2,
+                ByteCode::Call as u8,
+                0,
+                3,
             ]
         );
         assert!(func.constant_pool[0].is_heap_object());
@@ -532,13 +570,19 @@ mod tests {
             child_func.code,
             vec![
                 // preamble: inject parent closure "add" into r2
-                ByteCode::LdaSmi as u8, 0,
-                ByteCode::Star as u8, 2,
+                ByteCode::LdaSmi as u8,
+                0,
+                ByteCode::Star as u8,
+                2,
                 // body: return a + b
-                ByteCode::Ldar as u8, 0,
-                ByteCode::Star as u8, 3,
-                ByteCode::Ldar as u8, 1,
-                ByteCode::Add as u8, 3,
+                ByteCode::Ldar as u8,
+                0,
+                ByteCode::Star as u8,
+                3,
+                ByteCode::Ldar as u8,
+                1,
+                ByteCode::Add as u8,
+                3,
                 ByteCode::Return as u8,
             ]
         );
@@ -581,10 +625,14 @@ mod tests {
         assert_eq!(
             func.code,
             vec![
-                ByteCode::LdaSmi as u8, 0,
-                ByteCode::Star as u8, 0,
-                ByteCode::LdaSmi as u8, 1,
-                ByteCode::TestEqual as u8, 0,
+                ByteCode::LdaSmi as u8,
+                0,
+                ByteCode::Star as u8,
+                0,
+                ByteCode::LdaSmi as u8,
+                1,
+                ByteCode::TestEqual as u8,
+                0,
             ]
         );
         assert_eq!(heap.read_string(func.constant_pool[0]), "a");
@@ -619,13 +667,20 @@ mod tests {
         assert_eq!(
             func.code,
             vec![
-                ByteCode::Ldar as u8, 0,
-                ByteCode::Star as u8, 1,
-                ByteCode::LdaSmi as u8, 0,
-                ByteCode::TestGreater as u8, 1,
-                ByteCode::JumpIfFalse as u8, 4,
-                ByteCode::LdaSmi as u8, 1,
-                ByteCode::Star as u8, 2,
+                ByteCode::Ldar as u8,
+                0,
+                ByteCode::Star as u8,
+                1,
+                ByteCode::LdaSmi as u8,
+                0,
+                ByteCode::TestGreater as u8,
+                1,
+                ByteCode::JumpIfFalse as u8,
+                4,
+                ByteCode::LdaSmi as u8,
+                1,
+                ByteCode::Star as u8,
+                2,
             ]
         );
     }
